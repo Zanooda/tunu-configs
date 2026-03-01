@@ -8,7 +8,7 @@
     <l_current_max>210</l_current_max>
     <l_current_min>-90</l_current_min>
     <l_in_current_max>70</l_in_current_max>
-    <l_in_current_min>-19</l_in_current_min>
+    <l_in_current_min>0</l_in_current_min>
     <l_in_current_map_start>1</l_in_current_map_start>
     <l_in_current_map_filter>0</l_in_current_map_filter>
     <l_abs_current_max>300</l_abs_current_max>
@@ -117,12 +117,12 @@
     <foc_hfi_obs_ovr_sec>0.001</foc_hfi_obs_ovr_sec>
     <foc_hfi_samples>1</foc_hfi_samples>
     <foc_offsets_cal_mode>1</foc_offsets_cal_mode>
-    <foc_offsets_current__0>2100.79</foc_offsets_current__0>
-    <foc_offsets_current__1>2100.95</foc_offsets_current__1>
+    <foc_offsets_current__0>2100.37</foc_offsets_current__0>
+    <foc_offsets_current__1>2100.74</foc_offsets_current__1>
     <foc_offsets_current__2>0</foc_offsets_current__2>
-    <foc_offsets_voltage__0>0.0026</foc_offsets_voltage__0>
-    <foc_offsets_voltage__1>-0.0047</foc_offsets_voltage__1>
-    <foc_offsets_voltage__2>0.002</foc_offsets_voltage__2>
+    <foc_offsets_voltage__0>0.0022</foc_offsets_voltage__0>
+    <foc_offsets_voltage__1>-0.0043</foc_offsets_voltage__1>
+    <foc_offsets_voltage__2>0.0021</foc_offsets_voltage__2>
     <foc_offsets_voltage_undriven__0>0</foc_offsets_voltage_undriven__0>
     <foc_offsets_voltage_undriven__1>0</foc_offsets_voltage_undriven__1>
     <foc_offsets_voltage_undriven__2>0</foc_offsets_voltage_undriven__2>
