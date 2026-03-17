@@ -15,7 +15,7 @@
 
 ; Shutdown detection via PC4 (ADC channel 3)
 ; Steady-state ~2.69V, drops on power loss
-(def shutdown-threshold 2.55)
+(def shutdown-threshold 2.47)
 (def shutdown-triggered false)
 
 ; Einmalig nach dem Einschalten Betriebsbereitschaft bestätigen
