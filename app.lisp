@@ -84,12 +84,12 @@
     })
 
     ; ECU_ebs_set (0x4E2) - KERS voltage/current parameters
-    ; Big-endian uint16 x2, scale=10 → real value in mV/mA
+    ; ecu-service sends values already in mV/mA, no scaling needed
     (if (= id 0x4E2u32) {
         (var raw-voltage (bufget-u16 data 0))
         (var raw-current (bufget-u16 data 2))
-        (def kers-voltage (* raw-voltage 10))
-        (def kers-current (* raw-current 10))
+        (def kers-voltage raw-voltage)
+        (def kers-current raw-current)
         (print (list "KERS params V:" kers-voltage "mV, I:" kers-current "mA"))
 
         ; Store raw values to echo back on 0x7E5
