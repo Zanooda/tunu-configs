@@ -151,15 +151,27 @@
     (bits-enc-int statusByte_1 6 1 1)
     (bits-enc-int statusByte_1 7 0 1)
 
+    ; Voltage: (get-vin) returns V, ecu-service expects big-endian u16 in 10mV units
+    (bufset-u16 dataArray_0x7E0 0 (to-i (* (get-vin) 100.0)))
+
+    ; Current: (get-current-in) returns A, ecu-service expects big-endian i16 in 10mA units
+    ; Negative values = regen (charging battery)
+    (bufset-i16 dataArray_0x7E0 2 (to-i (* (get-current-in) 100.0)))
+
     (var speedhere (/ (* (get-speed) 3.6) 1.03))
 
     (bufset-u16 dataArray_0x7E0 4 (to-i (/ (to-float (abs (get-rpm))) 24.0)))
     (bufset-u8 dataArray_0x7E0 6 speedhere)
 
-    (bufset-u8 dataArray_0x7E0 7 0)
-    (if (> (get-current-in) 5)
-        (bufset-u8 dataArray_0x7E0 7 0x01)
+    ; Flags: bit0 = throttle, bit1 = brake (regen active)
+    (var flags 0)
+    (if (> (get-current-in) 5.0)
+        (setq flags (bitwise-or flags 0x01))
     )
+    (if (< (get-current-in) -0.5)
+        (setq flags (bitwise-or flags 0x02))
+    )
+    (bufset-u8 dataArray_0x7E0 7 flags)
 
     (bufset-u32 dataArray_0x7E2 0 (to-i (/ (to-float (sysinfo 'odometer)) 107.0)))
 
