@@ -7,13 +7,13 @@
     <sensor_mode>0</sensor_mode>
     <l_current_max>210</l_current_max>
     <l_current_min>-90</l_current_min>
-    <l_in_current_max>70</l_in_current_max>
+    <l_in_current_max>60</l_in_current_max>
     <l_in_current_min>0</l_in_current_min>
     <l_in_current_map_start>1</l_in_current_map_start>
     <l_in_current_map_filter>0</l_in_current_map_filter>
     <l_abs_current_max>300</l_abs_current_max>
     <l_min_erpm>-1530.34</l_min_erpm>
-    <l_max_erpm>13773</l_max_erpm>
+    <l_max_erpm>14385.2</l_max_erpm>
     <l_erpm_start>0.8</l_erpm_start>
     <l_max_erpm_fbrake>300</l_max_erpm_fbrake>
     <l_max_erpm_fbrake_cc>1500</l_max_erpm_fbrake_cc>
@@ -22,7 +22,7 @@
     <l_battery_cut_start>44</l_battery_cut_start>
     <l_battery_cut_end>40</l_battery_cut_end>
     <l_battery_regen_cut_start>58</l_battery_regen_cut_start>
-    <l_battery_regen_cut_end>54</l_battery_regen_cut_end>
+    <l_battery_regen_cut_end>56</l_battery_regen_cut_end>
     <l_slow_abs_current>0</l_slow_abs_current>
     <l_temp_fet_start>85</l_temp_fet_start>
     <l_temp_fet_end>100</l_temp_fet_end>
@@ -117,20 +117,20 @@
     <foc_hfi_obs_ovr_sec>0.001</foc_hfi_obs_ovr_sec>
     <foc_hfi_samples>1</foc_hfi_samples>
     <foc_offsets_cal_mode>1</foc_offsets_cal_mode>
-    <foc_offsets_current__0>2099.61</foc_offsets_current__0>
-    <foc_offsets_current__1>2100.82</foc_offsets_current__1>
+    <foc_offsets_current__0>2100.7</foc_offsets_current__0>
+    <foc_offsets_current__1>2101.53</foc_offsets_current__1>
     <foc_offsets_current__2>0</foc_offsets_current__2>
-    <foc_offsets_voltage__0>0.0015</foc_offsets_voltage__0>
-    <foc_offsets_voltage__1>-0.0045</foc_offsets_voltage__1>
-    <foc_offsets_voltage__2>0.0029</foc_offsets_voltage__2>
+    <foc_offsets_voltage__0>0.0018</foc_offsets_voltage__0>
+    <foc_offsets_voltage__1>-0.0039</foc_offsets_voltage__1>
+    <foc_offsets_voltage__2>0.002</foc_offsets_voltage__2>
     <foc_offsets_voltage_undriven__0>0</foc_offsets_voltage_undriven__0>
     <foc_offsets_voltage_undriven__1>0</foc_offsets_voltage_undriven__1>
     <foc_offsets_voltage_undriven__2>0</foc_offsets_voltage_undriven__2>
     <foc_phase_filter_enable>1</foc_phase_filter_enable>
     <foc_phase_filter_disable_fault>1</foc_phase_filter_disable_fault>
     <foc_phase_filter_max_erpm>4000</foc_phase_filter_max_erpm>
-    <foc_mtpa_mode>0</foc_mtpa_mode>
-    <foc_fw_current_max>50</foc_fw_current_max>
+    <foc_mtpa_mode>2</foc_mtpa_mode>
+    <foc_fw_current_max>20</foc_fw_current_max>
     <foc_fw_duty_start>0.9</foc_fw_duty_start>
     <foc_fw_q_current_factor>0.02</foc_fw_q_current_factor>
     <foc_fw_ramp_time>0.2</foc_fw_ramp_time>
