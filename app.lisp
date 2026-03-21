@@ -72,10 +72,10 @@
         ; l-current-min is negative (regen direction), 0.0 = no regen allowed
         (if kers-enabled {
             (var kers-amps (/ (to-float kers-current) 1000.0))
-            (conf-set 'l-current-min (* -1.0 kers-amps))
+            (conf-set 'l-in-current-min (* -1.0 kers-amps))
             (print (list "Regen enabled:" kers-amps "A"))
         } {
-            (conf-set 'l-current-min 0.0)
+            (conf-set 'l-in-current-min 0.0)
             (print "Regen disabled")
         })
 
@@ -214,3 +214,4 @@
     (def tick (+ tick 1))
     (sleep 0.005)
 })
+
