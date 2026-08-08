@@ -13,6 +13,15 @@
 (def kers-voltage 0)
 (def kers-current 0)
 
+; Low-speed KERS fade, in ERPM so it tracks the FOC sensor handover directly.
+; Coming down, the observer hands back to the halls between foc_sl_erpm (2000)
+; and foc_sl_erpm_start (1800). Braking through that blend is what rattles, so
+; regen is fully out by 2000 and ramps in over the octave above it.
+; With 48 poles and the 0.416 m wheel: 2000 erpm ~ 6.5 km/h, 4000 ~ 13 km/h.
+(def kers-fade-start-erpm 4000.0)
+(def kers-fade-end-erpm 2000.0)
+(def kers-scale 1.0)
+
 ; Shutdown detection via PC4 (ADC channel 3)
 ; Steady-state ~2.69V, drops on power loss
 (def shutdown-threshold 2.48)
@@ -181,6 +190,29 @@
     (sleep 0.01)
 })
 
+; Scale motor brake current with speed so KERS is out before the sensor handover.
+; l-in-current-min alone does not do this: at low ERPM hardly any current makes
+; it back to the battery, so the input limit never bites and the motor keeps
+; getting full brake current right through the handover and down to standstill.
+(defun update-kers-fade () {
+    (var erpm (abs (to-float (get-rpm))))
+    (var scale (if (not kers-enabled)
+        1.0
+        (if (< erpm kers-fade-end-erpm)
+            0.0
+            (if (> erpm kers-fade-start-erpm)
+                1.0
+                (/ (- erpm kers-fade-end-erpm)
+                   (- kers-fade-start-erpm kers-fade-end-erpm))
+            )
+        )
+    ))
+    (if (> (abs (- scale kers-scale)) 0.01) {
+        (def kers-scale scale)
+        (conf-set 'l-current-min-scale scale)
+    })
+})
+
 ; Check PC4 voltage and save odometer/runtime on shutdown
 (defun check-shutdown () {
     (var v (get-adc 3))
@@ -205,9 +237,11 @@
 ; Send initial status4 as not-kers (ebs_disabled)
 (send-status4 0 1)
 
-; Main loop: 5ms tick, shutdown check every tick, CAN stats every 40th tick (200ms)
+; Main loop: 5ms tick, shutdown check and KERS fade every tick,
+; CAN stats every 40th tick (200ms)
 (loopwhile t {
     (check-shutdown)
+    (update-kers-fade)
     (if (= (mod tick 40) 0) {
         (send_stats)
     })
