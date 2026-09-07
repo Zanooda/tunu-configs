@@ -48,6 +48,7 @@ even with no script installed.
 """
 
 import argparse
+import errno
 import os
 import socket
 import struct
@@ -125,7 +126,15 @@ class VescCan:
         frame = struct.pack(
             CAN_FRAME_FMT, (eid & 0x1FFFFFFF) | CAN_EFF_FLAG, len(data),
             bytes(data).ljust(8, b"\x00"))
-        self.sock.send(frame)
+        for attempt in range(100):
+            try:
+                self.sock.send(frame)
+                break
+            except OSError as error:
+                if error.errno != errno.ENOBUFS or attempt == 99:
+                    raise
+                time.sleep(0.01)
+        time.sleep(0.001)
 
     def _rx(self, deadline):
         """Read one extended frame addressed to our sender id. Returns
