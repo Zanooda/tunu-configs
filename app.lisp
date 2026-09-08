@@ -41,11 +41,25 @@
 
 ; Low-speed KERS fade, in ERPM so it tracks the FOC sensor handover directly.
 ; Coming down, the observer hands back to the halls between foc_sl_erpm (2000)
-; and foc_sl_erpm_start (1800). Braking through that blend is what rattles, so
-; regen is fully out by 2000 and ramps in over the octave above it.
-; With 48 poles and the 0.416 m wheel: 2000 erpm ~ 6.5 km/h, 4000 ~ 13 km/h.
-(def kers-fade-start-erpm 4000.0)
-(def kers-fade-end-erpm 2000.0)
+; and foc_sl_erpm_start (1800). Braking through that blend at full current is
+; what rattles, so the fade bottoms out at a floor just above the blend and the
+; floor carries through it, keeping the lever authoritative at crawl. The fade
+; band sits at very low speed: full regen down to ~8.5 km/h, floor below that.
+; Below the standstill cutoff the halls only give a coarse sector angle, and
+; brake current there can turn into a slight forward pull, so the scale drops
+; to zero unconditionally — KERS on or off. (The BOSCH 4K-45 ECU does the
+; equivalent with its motor-power deadband: regen disengages near standstill.)
+; With 48 poles and the 0.416 m wheel: 2200 erpm ~ 7.2 km/h, 2600 ~ 8.5, 300 ~ 1.
+(def kers-fade-start-erpm 2600.0)
+(def kers-fade-end-erpm 2200.0)
+(def kers-floor 0.25)
+(def kers-hold-cutoff-erpm 300.0)
+; Max change in scale per 5 ms tick: engage ramps in fast but not as a step
+; (~170 ms full sweep), and a noisy get-rpm in the fade band cannot chatter the
+; limit. The lever command itself is additionally ramped by the ADC app
+; (ramp_time_pos 0.3 s) and battery regen stays capped at the 0x4E2 current
+; limit (10 A default), so the pack never sees a current step.
+(def kers-scale-slew 0.03)
 (def kers-scale 1.0)
 
 ; Shutdown detection via PC4 (ADC channel 3)
@@ -110,8 +124,9 @@
 ;   bytes 2-5 = fault code (u32, big-endian)
 (defun send-status2 () {
     ; No FET temperature sensor on this controller: get-temp-fet reads a
-    ; floating ADC and climbs into triple digits. Report 0 instead.
-    (bufset-i8 dataArray_0x7E1 0 0)
+    ; floating ADC and climbs into triple digits. Pin a plausible ambient
+    ; 25 °C instead of 0, which still reads as freezing to consumers.
+    (bufset-i8 dataArray_0x7E1 0 25)
     (bufset-u8 dataArray_0x7E1 1 0)
     (bufset-u32 dataArray_0x7E1 2 (map-vesc-fault (get-fault)))
     (can-send-sid 0x7E1 dataArray_0x7E1)
@@ -297,26 +312,45 @@
     (sleep 0.01)
 })
 
-; Scale motor brake current with speed so KERS is out before the sensor handover.
-; l-in-current-min alone does not do this: at low ERPM hardly any current makes
-; it back to the battery, so the input limit never bites and the motor keeps
-; getting full brake current right through the handover and down to standstill.
-(defun update-kers-fade () {
-    (var erpm (abs (to-float (get-rpm))))
-    (var scale (if (not kers-enabled)
-        1.0
-        (if (< erpm kers-fade-end-erpm)
-            0.0
-            (if (> erpm kers-fade-start-erpm)
-                1.0
-                (/ (- erpm kers-fade-end-erpm)
-                   (- kers-fade-start-erpm kers-fade-end-erpm))
+; Scale motor brake current with speed so KERS eases out at very low speed
+; instead of riding the sensor handover. l-in-current-min alone does not do
+; this: at low ERPM hardly any current makes it back to the battery, so the
+; input limit never bites and the motor keeps getting full brake current right
+; through the handover and down to standstill.
+; Target scale for the current ERPM: zero below the standstill cutoff (always —
+; this is what kills the forward pull at crawl); with KERS off, full above it
+; (the lever brake is dissipative then, l-in-current-min is 0); with KERS on,
+; the floor below the fade band, a floor-to-full ramp across the band, and full
+; above it.
+(defun kers-fade-target (erpm)
+    (if (< erpm kers-hold-cutoff-erpm)
+        0.0
+        (if (not kers-enabled)
+            1.0
+            (if (< erpm kers-fade-end-erpm)
+                kers-floor
+                (if (> erpm kers-fade-start-erpm)
+                    1.0
+                    (+ kers-floor
+                       (* (- 1.0 kers-floor)
+                          (/ (- erpm kers-fade-end-erpm)
+                             (- kers-fade-start-erpm kers-fade-end-erpm))))
+                )
             )
         )
-    ))
-    (if (> (abs (- scale kers-scale)) 0.01) {
-        (def kers-scale scale)
-        (conf-set 'l-current-min-scale scale)
+    )
+)
+
+; Slew-limit toward the target so noisy ERPM cannot chatter the limit.
+(defun update-kers-fade () {
+    (var target (kers-fade-target (abs (to-float (get-rpm)))))
+    (var d (- target kers-scale))
+    (var new (if (> (abs d) kers-scale-slew)
+        (+ kers-scale (if (> d 0.0) kers-scale-slew (- 0.0 kers-scale-slew)))
+        target))
+    (if (> (abs (- new kers-scale)) 0.005) {
+        (def kers-scale new)
+        (conf-set 'l-current-min-scale new)
     })
 })
 
