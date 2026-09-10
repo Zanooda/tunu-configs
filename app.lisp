@@ -36,8 +36,16 @@
 
 ; KERS state
 (def kers-enabled false)
-(def kers-voltage 0)
 (def kers-current 0)
+; Regen voltage target in mV (0x4E2, 10 mV units on the wire). Full battery
+; regen authority at or below it, tapering linearly to zero across the band
+; above it, so braking into a nearly full pack eases off instead of pushing it
+; over the target.
+(def kers-voltage 56000)
+(def kers-voltage-taper 3000.0)
+; Battery-side regen limit currently applied (A, negative), so the loop only
+; writes the config when it actually changes.
+(def kers-amps-now 0.0)
 
 ; Low-speed KERS fade, in ERPM so it tracks the FOC sensor handover directly.
 ; Coming down, the observer hands back to the halls between foc_sl_erpm (2000)
@@ -47,8 +55,7 @@
 ; band sits at very low speed: full regen down to ~8.5 km/h, floor below that.
 ; Below the standstill cutoff the halls only give a coarse sector angle, and
 ; brake current there can turn into a slight forward pull, so the scale drops
-; to zero unconditionally — KERS on or off. (The BOSCH 4K-45 ECU does the
-; equivalent with its motor-power deadband: regen disengages near standstill.)
+; to zero unconditionally — KERS on or off.
 ; With 48 poles and the 0.416 m wheel: 2200 erpm ~ 7.2 km/h, 2600 ~ 8.5, 300 ~ 1.
 (def kers-fade-start-erpm 2600.0)
 (def kers-fade-end-erpm 2200.0)
@@ -60,7 +67,13 @@
 ; (ramp_time_pos 0.3 s) and battery regen stays capped at the 0x4E2 current
 ; limit (10 A default), so the pack never sees a current step.
 (def kers-scale-slew 0.03)
-(def kers-scale 1.0)
+; The VESC keeps its config while powered, so after a lisp restart the limits
+; would hold stale values (e.g. a regen limit armed by a handshake that the
+; fresh script never saw). Force the safe boot state: no battery regen and no
+; brake current until the loops take ownership and the vehicle asks for it.
+(conf-set 'l-in-current-min 0.0)
+(conf-set 'l-current-min-scale 0.0)
+(def kers-scale 0.0)
 
 ; Shutdown detection via PC4 (ADC channel 3)
 ; Steady-state ~2.69V, drops on power loss
@@ -191,16 +204,11 @@
         (def kers-enabled (= ebs-en 1))
         (print (list "KERS:" kers-enabled "gear:" gear-en "boost:" boost-en))
 
-        ; Toggle regen current limit on VESC
-        ; l-current-min is negative (regen direction), 0.0 = no regen allowed
-        (if kers-enabled {
-            (var kers-amps (/ (to-float kers-current) 1000.0))
-            (conf-set 'l-in-current-min (* -1.0 kers-amps))
-            (print (list "Regen enabled:" kers-amps "A"))
-        } {
-            (conf-set 'l-in-current-min 0.0)
-            (print "Regen disabled")
-        })
+        ; The battery-side regen limit (l-in-current-min, negative = regen
+        ; direction, 0.0 = none allowed) is applied by the main loop so the
+        ; voltage taper tracks the live pack voltage; only the state changes
+        ; here.
+        (print (list "Regen target:" (if kers-enabled "on" "off")))
 
         ; Report status4 back so the service sees the correct state
         (send-status4 ebs-en gear-en)
@@ -354,6 +362,33 @@
     })
 })
 
+; Battery-side regen voltage taper: full authority at or below the 0x4E2
+; target, linear to zero across the taper band above it.
+(defun kers-voltage-scale (vin-mv)
+    (if (< vin-mv kers-voltage)
+        1.0
+        (if (> vin-mv (+ kers-voltage kers-voltage-taper))
+            0.0
+            (/ (- (+ kers-voltage kers-voltage-taper) vin-mv)
+               kers-voltage-taper)
+        )
+    )
+)
+
+; Battery-side regen limit (l-in-current-min): the 0x4E2 current scaled by the
+; voltage taper while KERS is on, 0.0 when off. Runs every tick so the taper
+; follows the live pack voltage; writes the config only on real changes.
+(defun update-kers-current () {
+    (var target (if kers-enabled
+        (- 0.0 (* (/ (to-float kers-current) 1000.0)
+                  (kers-voltage-scale (* (get-vin) 1000.0))))
+        0.0))
+    (if (> (abs (- target kers-amps-now)) 0.05) {
+        (def kers-amps-now target)
+        (conf-set 'l-in-current-min target)
+    })
+})
+
 ; Check PC4 voltage and save odometer/runtime on shutdown
 (defun check-shutdown () {
     (var v (get-adc 3))
@@ -392,6 +427,7 @@
 (loopwhile t {
     (check-shutdown)
     (update-kers-fade)
+    (update-kers-current)
     (if (= (mod tick 40) 0) {
         (send_stats)
     })
