@@ -29,8 +29,44 @@
 
 ; KERS state
 (def kers-enabled false)
-(def kers-voltage 0)
 (def kers-current 0)
+; Regen voltage target in mV (0x4E2, 10 mV units on the wire). Full battery
+; regen authority at or below it, tapering linearly to zero across the band
+; above it, so braking into a nearly full pack eases off instead of pushing it
+; over the target.
+(def kers-voltage 56000)
+(def kers-voltage-taper 3000.0)
+; Battery-side regen limit currently applied (A, negative), so the loop only
+; writes the config when it actually changes.
+(def kers-amps-now 0.0)
+
+; Low-speed KERS fade, in ERPM so it tracks the FOC sensor handover directly.
+; Coming down, the observer hands back to the halls between foc_sl_erpm (2000)
+; and foc_sl_erpm_start (1800). Braking through that blend at full current is
+; what rattles, so the fade bottoms out at a floor just above the blend and the
+; floor carries through it, keeping the lever authoritative at crawl. The fade
+; band sits at very low speed: full regen down to ~8.5 km/h, floor below that.
+; Below the standstill cutoff the halls only give a coarse sector angle, and
+; brake current there can turn into a slight forward pull, so the scale drops
+; to zero unconditionally — KERS on or off.
+; With 48 poles and the 0.416 m wheel: 2200 erpm ~ 7.2 km/h, 2600 ~ 8.5, 300 ~ 1.
+(def kers-fade-start-erpm 2600.0)
+(def kers-fade-end-erpm 2200.0)
+(def kers-floor 0.25)
+(def kers-hold-cutoff-erpm 300.0)
+; Max change in scale per 5 ms tick: engage ramps in fast but not as a step
+; (~170 ms full sweep), and a noisy get-rpm in the fade band cannot chatter the
+; limit. The lever command itself is additionally ramped by the ADC app
+; (ramp_time_pos 0.3 s) and battery regen stays capped at the 0x4E2 current
+; limit (10 A default), so the pack never sees a current step.
+(def kers-scale-slew 0.03)
+; The VESC keeps its config while powered, so after a lisp restart the limits
+; would hold stale values (e.g. a regen limit armed by a handshake that the
+; fresh script never saw). Force the safe boot state: no battery regen and no
+; brake current until the loops take ownership and the vehicle asks for it.
+(conf-set 'l-in-current-min 0.0)
+(conf-set 'l-current-min-scale 0.0)
+(def kers-scale 0.0)
 
 ; Shutdown detection via PC4 (ADC channel 3)
 ; Steady-state ~2.69V, drops on power loss
@@ -94,8 +130,9 @@
 ;   bytes 2-5 = fault code (u32, big-endian)
 (defun send-status2 () {
     ; No FET temperature sensor on this controller: get-temp-fet reads a
-    ; floating ADC and climbs into triple digits. Report 0 instead.
-    (bufset-i8 dataArray_0x7E1 0 0)
+    ; floating ADC and climbs into triple digits. Pin a plausible ambient
+    ; 25 °C instead of 0, which still reads as freezing to consumers.
+    (bufset-i8 dataArray_0x7E1 0 25)
     (bufset-u8 dataArray_0x7E1 1 0)
     (bufset-u32 dataArray_0x7E1 2 (map-vesc-fault (get-fault)))
     (can-send-sid 0x7E1 dataArray_0x7E1)
@@ -114,7 +151,8 @@
 })
 
 ; Send the ECU configuration block (0x7E9-0x7EF) from the live motor config.
-; 10mV / 10mA units on the wire.
+; 10mV / 10mA units on the wire. conf-get has to be called from here, not at
+; script load: these names resolve fine at runtime, but a top-level read errors.
 (defun send-config-block () {
     (bufset-u16 dataArray_0x7E9 0 (to-i (* (conf-get 'l-max-vin) 100)))
     (can-send-sid 0x7E9 dataArray_0x7E9)
@@ -160,16 +198,11 @@
         (def kers-enabled (= ebs-en 1))
         (print (list "KERS:" kers-enabled "gear:" gear-en "boost:" boost-en))
 
-        ; Toggle regen current limit on VESC
-        ; l-current-min is negative (regen direction), 0.0 = no regen allowed
-        (if kers-enabled {
-            (var kers-amps (/ (to-float kers-current) 1000.0))
-            (conf-set 'l-in-current-min (* -1.0 kers-amps))
-            (print (list "Regen enabled:" kers-amps "A"))
-        } {
-            (conf-set 'l-in-current-min 0.0)
-            (print "Regen disabled")
-        })
+        ; The battery-side regen limit (l-in-current-min, negative = regen
+        ; direction, 0.0 = none allowed) is applied by the main loop so the
+        ; voltage taper tracks the live pack voltage; only the state changes
+        ; here.
+        (print (list "Regen target:" (if kers-enabled "on" "off")))
 
         ; Report status4 back so the service sees the correct state
         (send-status4 ebs-en gear-en)
@@ -281,6 +314,75 @@
     (sleep 0.01)
 })
 
+; Scale motor brake current with speed so KERS eases out at very low speed
+; instead of riding the sensor handover. l-in-current-min alone does not do
+; this: at low ERPM hardly any current makes it back to the battery, so the
+; input limit never bites and the motor keeps getting full brake current right
+; through the handover and down to standstill.
+; Target scale for the current ERPM: zero below the standstill cutoff (always —
+; this is what kills the forward pull at crawl); with KERS off, full above it
+; (the lever brake is dissipative then, l-in-current-min is 0); with KERS on,
+; the floor below the fade band, a floor-to-full ramp across the band, and full
+; above it.
+(defun kers-fade-target (erpm)
+    (if (< erpm kers-hold-cutoff-erpm)
+        0.0
+        (if (not kers-enabled)
+            1.0
+            (if (< erpm kers-fade-end-erpm)
+                kers-floor
+                (if (> erpm kers-fade-start-erpm)
+                    1.0
+                    (+ kers-floor
+                       (* (- 1.0 kers-floor)
+                          (/ (- erpm kers-fade-end-erpm)
+                             (- kers-fade-start-erpm kers-fade-end-erpm))))
+                )
+            )
+        )
+    )
+)
+
+; Slew-limit toward the target so noisy ERPM cannot chatter the limit.
+(defun update-kers-fade () {
+    (var target (kers-fade-target (abs (to-float (get-rpm)))))
+    (var d (- target kers-scale))
+    (var new (if (> (abs d) kers-scale-slew)
+        (+ kers-scale (if (> d 0.0) kers-scale-slew (- 0.0 kers-scale-slew)))
+        target))
+    (if (> (abs (- new kers-scale)) 0.005) {
+        (def kers-scale new)
+        (conf-set 'l-current-min-scale new)
+    })
+})
+
+; Battery-side regen voltage taper: full authority at or below the 0x4E2
+; target, linear to zero across the taper band above it.
+(defun kers-voltage-scale (vin-mv)
+    (if (< vin-mv kers-voltage)
+        1.0
+        (if (> vin-mv (+ kers-voltage kers-voltage-taper))
+            0.0
+            (/ (- (+ kers-voltage kers-voltage-taper) vin-mv)
+               kers-voltage-taper)
+        )
+    )
+)
+
+; Battery-side regen limit (l-in-current-min): the 0x4E2 current scaled by the
+; voltage taper while KERS is on, 0.0 when off. Runs every tick so the taper
+; follows the live pack voltage; writes the config only on real changes.
+(defun update-kers-current () {
+    (var target (if kers-enabled
+        (- 0.0 (* (/ (to-float kers-current) 1000.0)
+                  (kers-voltage-scale (* (get-vin) 1000.0))))
+        0.0))
+    (if (> (abs (- target kers-amps-now)) 0.05) {
+        (def kers-amps-now target)
+        (conf-set 'l-in-current-min target)
+    })
+})
+
 ; Check PC4 voltage and save odometer/runtime on shutdown
 (defun check-shutdown () {
     (var v (get-adc 3))
@@ -312,12 +414,14 @@
 (sleep 0.01)
 (send-config-block)
 
-; Main loop: 5ms tick, shutdown check every tick, CAN stats every 40th tick
-; (200ms), diagnostics every 200th (1s). A fault repeated faster than 1Hz keeps
-; resetting the consumer's 0.5s request timer, so it never asks for the state
-; that would clear the fault.
+; Main loop: 5ms tick, shutdown check and KERS fade every tick, CAN stats every
+; 40th tick (200ms), diagnostics every 200th (1s). A fault repeated faster than
+; 1Hz keeps resetting the consumer's 0.5s request timer, so it never asks for
+; the state that would clear the fault.
 (loopwhile t {
     (check-shutdown)
+    (update-kers-fade)
+    (update-kers-current)
     (if (= (mod tick 40) 0) {
         (send_stats)
     })
