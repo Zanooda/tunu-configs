@@ -126,12 +126,16 @@ class VescCan:
         frame = struct.pack(
             CAN_FRAME_FMT, (eid & 0x1FFFFFFF) | CAN_EFF_FLAG, len(data),
             bytes(data).ljust(8, b"\x00"))
-        for attempt in range(100):
+        # ENOBUFS = TX queue full, typically because the ECU is busy erasing or
+        # programming flash and not ACKing quickly. That is transient during a
+        # multi-chunk write, so keep retrying for a few seconds rather than
+        # aborting with the image half written.
+        for attempt in range(600):
             try:
                 self.sock.send(frame)
                 break
             except OSError as error:
-                if error.errno != errno.ENOBUFS or attempt == 99:
+                if error.errno != errno.ENOBUFS or attempt == 599:
                     raise
                 time.sleep(0.01)
         time.sleep(0.001)
@@ -418,7 +422,21 @@ def cmd_write(v, source_bytes, progress=True):
     while ofs < total:
         part = image[ofs:ofs + chunk]
         payload = bytes([COMM_LISP_WRITE_CODE]) + be32(ofs) + part
-        reply = v.query(payload, expect_id=COMM_LISP_WRITE_CODE, timeout=3.0)
+        # Mid-image the ECU can stall while it erases and programs flash, so a
+        # missing reply is not fatal: the ack carries the offset, which makes
+        # resending the same chunk idempotent. Retry before giving up.
+        reply = None
+        for attempt in range(6):
+            try:
+                reply = v.query(payload, expect_id=COMM_LISP_WRITE_CODE, timeout=5.0)
+            except OSError as error:
+                reply = None
+                sys.stderr.write("\n  tx stalled at offset %d (%s)\n" % (ofs, error))
+            if reply is not None:
+                break
+            sys.stderr.write("\n  no reply at offset %d, retry %d/6\n" % (ofs, attempt + 1))
+            sys.stderr.flush()
+            time.sleep(0.5)
         if reply is None:
             raise IOError("no reply to WRITE_CODE at offset %d" % ofs)
         if reply[1] != 1:
@@ -437,7 +455,13 @@ def cmd_write(v, source_bytes, progress=True):
 
 # --- engine power management via lsc ---
 def engine_set(state):
-    subprocess.run(["lsc", "engine", state], check=False, timeout=15)
+    # lsc prints "✓ Engine power: on" to stdout. Keep it off stdout: `read` and
+    # `write` use stdout as the data channel, and mixing the two silently
+    # corrupts the output (a readback then differs from the file it came from).
+    res = subprocess.run(["lsc", "engine", state], check=False, timeout=15,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if res.stdout:
+        sys.stderr.write(res.stdout)
 
 
 def main():
