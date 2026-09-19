@@ -55,11 +55,12 @@
 (def kers-floor 0.25)
 (def kers-hold-cutoff-erpm 300.0)
 ; Max change in scale per 5 ms tick: engage ramps in fast but not as a step
-; (~170 ms full sweep), and a noisy get-rpm in the fade band cannot chatter the
+; (~60 ms full sweep), and a noisy get-rpm in the fade band cannot chatter the
 ; limit. The lever command itself is additionally ramped by the ADC app
-; (ramp_time_pos 0.3 s) and battery regen stays capped at the 0x4E2 current
+; (ramp_time_pos 0.3 s), the firmware truncates each current step
+; (cc_ramp_step_max 0.04) and battery regen stays capped at the 0x4E2 current
 ; limit (10 A default), so the pack never sees a current step.
-(def kers-scale-slew 0.03)
+(def kers-scale-slew 0.08)
 ; The VESC keeps its config while powered, so after a lisp restart the limits
 ; would hold stale values (e.g. a regen limit armed by a handshake that the
 ; fresh script never saw). Force the safe boot state: no battery regen and no
