@@ -69,10 +69,16 @@
 (conf-set 'l-current-min-scale 0.0)
 (def kers-scale 0.0)
 
-; Shutdown detection via PC4 (ADC channel 3)
-; Steady-state ~2.69V, drops on power loss
-(def shutdown-threshold 2.48)
+; Shutdown detection via pack voltage. When power is cut, Vin collapses well
+; before the logic rail does, which leaves time for the flash write. 40V is
+; below a 14S pack's empty cutoff, so sag in normal riding cannot reach it.
+; Re-arm level: once Vin is back above this, a new drop saves again, so a dip
+; that recovers (or a battery swap) does not disable saves for the session.
+(def shutdown-vin-threshold 40.0)
+(def shutdown-vin-rearm 44.0)
 (def shutdown-triggered false)
+; Ignore the detector for the first second so Vin ramping up at boot cannot fire it.
+(def shutdown-arm-tick 200)
 
 ; Einmalig nach dem Einschalten Betriebsbereitschaft bestätigen
 (bufset-u8 dataArray_0x7E4 0 1)
@@ -384,12 +390,18 @@
     })
 })
 
-; Check PC4 voltage and save odometer/runtime on shutdown
+; Check pack voltage and save odometer on shutdown. Latches on a drop, re-arms
+; once Vin recovers.
 (defun check-shutdown () {
-    (var v (get-adc 3))
-    (if (and (< v shutdown-threshold) (not shutdown-triggered)) {
-        (def shutdown-triggered true)
-        (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
+    (var vin (get-vin))
+    (if (> tick shutdown-arm-tick) {
+        (if (and (< vin shutdown-vin-threshold) (not shutdown-triggered)) {
+            (def shutdown-triggered true)
+            (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
+        })
+        (if (and shutdown-triggered (> vin shutdown-vin-rearm))
+            (def shutdown-triggered false)
+        )
     })
 })
 
@@ -416,9 +428,10 @@
 (send-config-block)
 
 ; Main loop: 5ms tick, shutdown check and KERS fade every tick, CAN stats every
-; 40th tick (200ms), diagnostics every 200th (1s). A fault repeated faster than
-; 1Hz keeps resetting the consumer's 0.5s request timer, so it never asks for
-; the state that would clear the fault.
+; 40th tick (200ms), status2 every 200th (1s). A fault repeated faster than 1Hz
+; keeps resetting the
+; consumer's 0.5s request timer, so it never asks for the state that would
+; clear the fault.
 (loopwhile t {
     (check-shutdown)
     (update-kers-fade)
@@ -432,4 +445,3 @@
     (def tick (+ tick 1))
     (sleep 0.005)
 })
-
