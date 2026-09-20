@@ -12,8 +12,8 @@
     <l_in_current_map_start>1</l_in_current_map_start>
     <l_in_current_map_filter>0</l_in_current_map_filter>
     <l_abs_current_max>300</l_abs_current_max>
-    <l_min_erpm>-30000</l_min_erpm>
-    <l_max_erpm>30000</l_max_erpm>
+    <l_min_erpm>-1530.34</l_min_erpm>
+    <l_max_erpm>14385.2</l_max_erpm>
     <l_erpm_start>0.8</l_erpm_start>
     <l_max_erpm_fbrake>300</l_max_erpm_fbrake>
     <l_max_erpm_fbrake_cc>1500</l_max_erpm_fbrake_cc>
@@ -130,7 +130,7 @@
     <foc_phase_filter_disable_fault>1</foc_phase_filter_disable_fault>
     <foc_phase_filter_max_erpm>4000</foc_phase_filter_max_erpm>
     <foc_mtpa_mode>2</foc_mtpa_mode>
-    <foc_fw_current_max>50</foc_fw_current_max>
+    <foc_fw_current_max>20</foc_fw_current_max>
     <foc_fw_duty_start>0.9</foc_fw_duty_start>
     <foc_fw_q_current_factor>0.02</foc_fw_q_current_factor>
     <foc_fw_ramp_time>0.2</foc_fw_ramp_time>
