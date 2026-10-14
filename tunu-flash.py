@@ -85,6 +85,7 @@ COMM_LISP_REPL_CMD = 138
 RX_BUFFER_SIZE = 512
 
 CAN_EFF_FLAG = 0x80000000
+CAN_RTR_FLAG = 0x40000000
 CAN_FRAME_FMT = "=IB3x8s"  # can_id, can_dlc, 3 pad, 8 data
 
 # CRC16 CCITT, poly 0x1021, init 0x0000, no reflection (util/crc.c crc16()).
@@ -122,6 +123,9 @@ class VescCan:
         self.sender = sender
         self.timeout = timeout
         self.sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        # Broadcast telemetry must not fill the reply queue while a command is idle.
+        self.sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, struct.pack(
+            "=II", CAN_EFF_FLAG | sender, CAN_EFF_FLAG | CAN_RTR_FLAG | 0xFF))
         self.sock.bind((iface,))
 
     def close(self):
