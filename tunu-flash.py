@@ -319,7 +319,12 @@ def cmd_version(v):
 def cmd_repl(v, expr, collect=2.0):
     """Send a REPL expression and gather the LISP_PRINT output it produces."""
     payload = bytes([COMM_LISP_REPL_CMD]) + expr.encode("utf-8") + b"\x00"
+    # Firmware ignores REPL commands arriving within 500 ms of the last one.
+    wait = getattr(v, "_last_repl_sent", float("-inf")) + 0.6 - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
     v.send_command(payload, send_flag=0)
+    v._last_repl_sent = time.monotonic()
     lines = []
     deadline = time.monotonic() + collect
     while time.monotonic() < deadline:

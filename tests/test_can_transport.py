@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -39,6 +40,29 @@ class ReceiveFilterTests(unittest.TestCase):
                 for frame_id in (0x80000946, 0x80003946, 0x800008FC,
                                  0x7E0, sender, 0xC0000000 | sender):
                     self.assertFalse(matches(frame_id), hex(frame_id))
+
+
+class ReplPacingTests(unittest.TestCase):
+    def test_consecutive_commands_respect_firmware_rate_limit(self):
+        clock = [10.0]
+        sent = []
+        transport = SimpleNamespace(
+            send_command=lambda *a, **kw: sent.append(clock[0]),
+            recv_reply=lambda **kw: None,
+        )
+
+        def sleep(delay):
+            clock[0] += delay
+
+        with patch.object(flash.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(flash.time, "sleep", side_effect=sleep) as sleeper:
+            for elapsed in (0, 0.1, 0.7, 0.3):
+                clock[0] += elapsed
+                self.assertEqual(flash.cmd_repl(transport, "(+ 1 2)", collect=0), [])
+        self.assertEqual(sleeper.call_count, 2)
+        for first, second in zip(sent, sent[1:]):
+            self.assertGreaterEqual(second - first, 0.6 - 1e-9)
+        self.assertEqual(sent[0], 10.0)
 
 
 if __name__ == "__main__":
