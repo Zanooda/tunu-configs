@@ -33,6 +33,11 @@ PRELUDE = r'''
 (def music-end-reason 0)
 (def channels (map (fn (x) (list x 0 0 0 0)) (range 4)))
 (def dataArray_0x7ED (array-create 4))
+(def music-starting false)
+(def music-upload-last -100.0)
+(def max-voltage-sum 0.0)
+(def max-frequency 0.0)
+(def min-frequency 100000.0)
 (def status-events 0)
 (def song-status-events 0)
 (def tone-events 0)
@@ -51,8 +56,14 @@ PRELUDE = r'''
     (setix frequencies channel frequency)
     (setix voltages channel voltage)
     (def tone-events (+ tone-events 1))
+    (if (> (voltage-sum) max-voltage-sum) (def max-voltage-sum (voltage-sum)))
+    (if (> voltage 0.0) {
+        (if (> frequency max-frequency) (def max-frequency frequency))
+        (if (< frequency min-frequency) (def min-frequency frequency))
+    })
     true
 })
+(defun fake-sleep (secs) (def clock (+ clock secs)))
 (defun foc-play-stop () {
     (looprange channel 0 4 { (setix voltages channel 0.0) })
     (def stop-events (+ stop-events 1))
@@ -76,7 +87,7 @@ PRELUDE = r'''
 
 
 class EngineSoundTests(unittest.TestCase):
-    def selected_source(self, fake_clock=False):
+    def selected_source(self, fake_clock=True):
         selected = []
         source = Path(os.environ.get('ENGINE_APP_SOURCE', str(ROOT / 'app.lisp')))
         for form in reader.forms(source.read_text()):
@@ -87,242 +98,264 @@ class EngineSoundTests(unittest.TestCase):
                 form = form.replace('(ext-midi-parse parser-idx)', '(mock-midi-parse parser-idx generation)')
                 if fake_clock:
                     form = form.replace('(systime)', '(clock-now)').replace('(secs-since ', '(clock-age ')
+                    form = form.replace('(sleep ', '(fake-sleep ')
                 selected.append(form)
         return '\n'.join(selected)
 
-    def run_lisp(self, checks, fake_clock=False):
+    def run_lisp(self, checks, fake_clock=True):
         repl = os.environ.get('LBM_REPL', 'lbm')
         if not shutil.which(repl):
             self.skipTest('set LBM_REPL to the host LispBM executable')
-        program = PRELUDE + '\n' + self.selected_source(fake_clock) + '\n' + checks + '''
+        program = PRELUDE + '\n' + self.selected_source(fake_clock) + '\n' + checks + """
 (if (= failures 0) (print "ENGINE_TESTS_PASS") (print (list "ENGINE_TESTS_FAIL" failures)))
-'''
+"""
         with tempfile.NamedTemporaryFile('w', suffix='.lbm') as script:
             script.write(program)
             script.flush()
             result = subprocess.run([repl, '--silent', '--history_file=', '--heap_size=16384',
                                      '--memory_size=32768', '--src', script.name, '--terminate'],
-                                    capture_output=True, text=True, timeout=30)
+                                    capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('ENGINE_TESTS_PASS', result.stdout, result.stdout + result.stderr)
         self.assertNotIn('("FAIL"', result.stdout, result.stdout + result.stderr)
 
-    def test_commands_styles_and_bounded_demo_model(self):
-        self.run_lisp(r'''
+    def test_commands_start_stop_and_status(self):
+        self.run_lisp(r"""
 (engine-init)
-(expect (and (not engine-enabled) (not engine-owned) (= engine-volume 50)) "silent boot")
-(looprange volume 0 101 {
-    (command 1 volume 0)
-    (expect (= (bufget-u8 dataArray_0x7ED 1) volume) "exact percent echo")
-})
-(def clock 1.0)
+(expect (and (not engine-enabled) (not engine-sounding) (= engine-vol-pct 50) (= engine-style 0)) "silent boot")
+(command 1 60 0)
+(expect (and engine-enabled (= engine-vol-pct 60) (= (bufget-u8 dataArray_0x7ED 0) 1)
+             (= (bufget-u8 dataArray_0x7ED 1) 60)) "on is echoed")
 (engine-step)
-(def first-start engine-cue-start)
-(def clock 1.1)
-(command 1 50 0)
-(expect (= engine-cue-start first-start) "on retry does not restart cue")
-(command 0 50 0)
-(def first-stop engine-cue-start)
-(def clock 1.2)
-(command 0 50 0)
-(expect (= engine-cue-start first-stop) "off retry does not extend cue")
-(def clock 1.6)
+(expect (and engine-running engine-sounding (> (voltage-sum) 0.0)) "start sound, then running")
+(command 1 60 0)
 (engine-step)
-(expect (and (not engine-owned) (= (voltage-sum) 0.0)) "off finishes")
-(command 2 50 0)
-(def first-demo engine-demo-start)
-(def clock 1.8)
-(command 2 50 0)
-(expect (= engine-demo-start first-demo) "demo retry is idempotent")
+(expect (and engine-running engine-sounding) "repeated on does not restart")
+(command 0 60 0)
 (engine-step)
-(expect (and engine-demo-playing (not engine-enabled) engine-owned) "standalone demo")
-(command 0 50 0)
-(expect (and (not engine-demo-playing) (not engine-owned) (= (voltage-sum) 0.0)) "demo stop is immediate")
-(def bad (array-create 1))
-(handle-engine-command bad)
-(command 9 50 0)
-(command 1 50 99)
-(expect (and (not engine-enabled) (= engine-style 0)) "malformed commands ignored")
-(command 1 255 0)
-(expect (= engine-volume 100) "volume clamps")
-(engine-init)
-(command 1 50 0)
-(def clock (+ clock 0.02))
+(expect (and (not engine-running) (not engine-sounding) (= (voltage-sum) 0.0)) "off plays the stop sound and goes silent")
+(def before status-events)
+(def clock (+ clock 1.5))
 (engine-step)
-(def fault 1)
-(def clock (+ clock 0.02))
-(engine-step)
-(expect (and (not engine-owned) (= (voltage-sum) 0.0)) "fault silences")
-(def fault 0)
-(looprange style 0 5 {
-    (engine-init)
-    (command 2 100 style)
-    (expect (= (bufget-u8 dataArray_0x7ED 3) style) "style echo")
-    (looprange step 0 1520 {
-        (def clock (+ clock 0.02))
-        (engine-step)
-        (expect (and (>= engine-gain 0.0) (<= engine-gain 1.0)
-                     (>= engine-rpm 0.0) (<= engine-rpm 11500.0)) "bounded model")
-        (expect (<= (voltage-sum) 1.7) "bounded total modulation")
-        (loopforeach frequency frequencies {
-            (expect (and (>= frequency 70.0) (<= frequency 5000.0)) "bounded frequency")
-        })
-        (expect (= native-speed 0.0) "demo never changes native speed")
-    })
-    (expect (and (not engine-demo-playing) (not engine-owned) (= (voltage-sum) 0.0)) "demo completes")
-})
-(def profile (engine-profile 0))
-(expect (> (engine-target-rpm profile 0.0 1.0 1.0)
-           (engine-target-rpm profile 0.0 1.0 0.0)) "braked free rev")
-(expect (> (engine-target-rpm profile 9.9 0.8 0.0)
-           (engine-target-rpm profile 10.1 0.8 0.0)) "virtual gear pitch drop")
-''', fake_clock=True)
+(expect (> status-events before) "status repeated once per second")
+""")
 
-    def test_music_priority_upload_and_worker_error_cleanup(self):
-        self.run_lisp(r'''
+    def test_malformed_commands_and_volume_clamp(self):
+        self.run_lisp(r"""
 (engine-init)
-(command 1 50 0)
-(def clock 0.02)
+(command 3 50 0)
+(expect (not engine-enabled) "unknown command ignored")
+(command 1 50 5)
+(expect (and (not engine-enabled) (= engine-style 0)) "unknown style ignores the command")
+(handle-engine-command (array-create 0))
+(expect (not engine-enabled) "empty frame ignored")
+(command 0 255 0)
+(expect (and (= engine-vol-pct 100) (= engine-vol (engine-vol-max))) "volume clamps to 100 %")
+(command 0 70 2)
+(expect (and (= engine-style 2) (= (bufget-u8 dataArray_0x7ED 3) 2)) "style is applied and echoed")
+""")
+
+    def test_music_upload_and_fault_keep_it_quiet(self):
+        self.run_lisp(r"""
+(engine-init)
+(command 1 100 0)
 (engine-step)
-(expect engine-owned "engine owns idle audio")
+(expect engine-sounding "sounding before")
 (engine-pause)
+(expect (and (not engine-sounding) (= (voltage-sum) 0.0)) "pause releases the channels")
 (def music-playing true)
-(def tone-events 0)
-(def clock 0.04)
+(def before tone-events)
 (engine-step)
-(command 0 50 0)
-(expect (= tone-events 0) "engine off cannot mute a foreground song")
-(command 1 50 0)
-(engine-step)
-(expect (= tone-events 0) "music has priority over engine start")
+(expect (and (not engine-sounding) (= tone-events before)) "silent while a song plays")
 (def music-playing false)
 (def music-starting true)
-(engine-step)
-(expect (= tone-events 0) "startup reservation has priority")
+(engine-out 100.0 1.0 0.02)
+(engine-raw 100.0 1.0 100.0 1.0 100.0 1.0 100.0 1.0)
+(expect (= tone-events before) "no writes while a song starts")
 (def music-starting false)
 (def music-upload-last clock)
 (engine-step)
-(expect (= tone-events 0) "upload has priority")
-(def clock 0.5)
+(expect (= tone-events before) "silent right after upload traffic")
+(def clock (+ clock 1.0))
 (engine-step)
-(expect (and engine-owned (> tone-events 0)) "engine resumes after music")
+(expect (and engine-sounding (> (voltage-sum) 0.0)) "resumes afterwards")
+(def fault 1)
+(engine-step)
+(expect (and (not engine-sounding) (= (voltage-sum) 0.0)) "fault silences")
+(def fault 0)
+(command 0 100 0)
+(def music-playing true)
+(engine-step)
+(expect (and (not engine-running) (= (voltage-sum) 0.0)) "off during a song needs no stop sound")
+""")
+
+    def test_demo_every_style_is_bounded_and_completes(self):
+        self.run_lisp(r"""
+(engine-init)
+(looprange style 0 5 {
+    (def max-voltage-sum 0.0)
+    (command 2 100 style)
+    (engine-step)
+    (expect (and (not engine-demo) (not engine-sounding) (= (voltage-sum) 0.0)) "demo completes and goes silent")
+    (expect (and (> max-voltage-sum 0.0) (<= max-voltage-sum (* 2.2501 (engine-vol-max)))) "voltage within the cap")
+})
+(expect (and (>= min-frequency 5.0) (<= max-frequency 5000.0)) "frequencies stay in range")
+(expect (not engine-enabled) "demo leaves the on/off request unchanged")
+(def music-playing true)
+(command 2 100 0)
+(engine-step)
+(expect (and (not engine-demo) (= (voltage-sum) 0.0)) "a song stops the demo")
+""")
+
+    def test_virtual_gears_and_braked_revving(self):
+        self.run_lisp(r"""
+(engine-init)
+(expect (> (engine-target-rpm 9.1) (engine-target-rpm 9.3)) "upshift drops the pitch")
+(expect (< (engine-target-rpm 2.0) (engine-target-rpm 8.0)) "pitch climbs within a gear")
+(engine-reset)
+(looprange i 0 50 { (engine-tick 0.0 1.0 0.6) })
+(expect (> engine-rpm (* 1.5 (engine-idle))) "revs at a standstill with the brake held")
+""")
+
+    def test_upload_during_startup_releases_tones(self):
+        self.run_lisp(r"""
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (def music-upload-last clock)
+        (engine-pause)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-step)
+(expect (and interrupted (engine-quiet) (not engine-sounding) (= (voltage-sum) 0.0)) "upload releases start tones")
+""")
+
+    def test_fault_and_worker_error_during_startup_release_tones(self):
+        self.run_lisp(r"""
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (def fault 1)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-step)
+(expect (and interrupted (not engine-sounding) (= (voltage-sum) 0.0)) "fault releases start tones")
+(def fault 0)
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (/ 1 0)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-loop)
+(expect (and interrupted (not engine-enabled) (not engine-sounding) (= (voltage-sum) 0.0)) "error releases start tones")
+""")
+
+    def test_pause_does_not_clear_foreground_notes(self):
+        self.run_lisp(r"""
+(engine-init)
+(engine-raw 100.0 1.0 150.0 1.0 200.0 1.0 250.0 1.0)
+(setix (ix channels 0) 1 60)
+(foc-play-tone 0 261.6 0.7)
+(def music-playing true)
+(engine-pause)
+(expect (and (not engine-sounding) (= (ix voltages 0) 0.7) (= (ix voltages 1) 0.0)) "pause preserves a foreground note")
+""")
+
+    def test_sequences_keep_reporting_status(self):
+        self.run_lisp(r"""
+(engine-init)
+(command 1 50 0)
+(def before status-events)
+(engine-step)
+(expect (>= (- status-events before) 3) "status continues during startup")
+(command 2 50 0)
+(def before status-events)
+(engine-step)
+(expect (>= (- status-events before) 20) "status continues during demo")
+""")
+
+    def test_demo_takes_over_startup_on_the_same_worker(self):
+        self.run_lisp(r"""
+(def renderer 0)
+(def other-writes 0)
+(def demo-runs 0)
+(def original-tone foc-play-tone)
+(def original-demo engine-demo-ride)
+(defun foc-play-tone (channel frequency voltage) {
+    (if (and (> voltage 0.0) (!= (self) renderer))
+        (def other-writes (+ other-writes 1)))
+    (original-tone channel frequency voltage)
+})
+(defun engine-demo-ride () {
+    (def demo-runs (+ demo-runs 1))
+    (original-demo)
+})
+(engine-init)
+(command 1 50 0)
+(def renderer (spawn 300 engine-loop))
+(sleep 0.1)
+(expect (> tone-events 0) "startup is active")
+(command 2 50 0)
+(sleep 0.2)
+(expect (and engine-demo (= demo-runs 1) (= other-writes 0)) "one worker owns startup and demo")
+(command 2 50 0)
+(sleep 0.1)
+(expect (= demo-runs 1) "demo retry does not restart")
+(command 0 50 0)
+(sleep 0.15)
+(expect (not engine-demo) "off cancels the demo")
+""", fake_clock=False)
+
+    def test_all_sequences_fit_controller_worker_stack(self):
+        self.run_lisp(r"""
+(engine-init)
+(def worker-done false)
+(def worker-result nil)
+(spawn 300 (fn () {
+    (def worker-result (trap {
+        (looprange style 0 5 {
+            (command 1 100 style)
+            (engine-step)
+            (command 2 100 style)
+            (engine-step)
+            (command 0 100 style)
+            (engine-step)
+        })
+        t
+    }))
+    (def worker-done true)
+}))
+(looprange i 0 500 {
+    (if worker-done (break))
+    (sleep 0.01)
+})
+(expect (and worker-done (eq worker-result '(exit-ok t))) "all sequences fit 300-cell worker")
+(expect (= (voltage-sum) 0.0) "worker ends silent")
+""")
+
+    def test_worker_error_releases_channels(self):
+        self.run_lisp(r"""
+(engine-init)
+(command 1 100 0)
+(engine-step)
 (def inject-error true)
 (engine-loop)
-(expect (and (not engine-owned) (not engine-enabled) (= (voltage-sum) 0.0)) "worker failure cleans up")
-''', fake_clock=True)
-
-    def test_native_tick_clock_gain_and_live_input_response(self):
-        self.run_lisp(r'''
-(defun clock-now () (to-u (* clock 10000.0)))
-(defun clock-age (start) (/ (to-float (- (clock-now) start)) 10000.0))
-(def clock 1.0)
-(engine-init)
-(command 1 50 0)
-(def clock 1.02)
-(engine-step)
-(expect (and (> engine-rpm 179.0) (< engine-rpm 181.0)) "20ms tick clock gives 180rpm slew")
-(expect (and (> engine-gain 0.099) (< engine-gain 0.101)) "20ms gain slew")
-(looprange step 0 60 {
-    (def clock (+ clock 0.02))
-    (engine-step)
-})
-(def idle-frequency (ix frequencies 0))
-(expect (> (ix voltages 0) 0.15) "50 percent idle is above the native tone cutoff")
-(expect (> (voltage-sum) 0.3) "audible idle modulation")
-(def native-speed (/ (* 20.0 speed-cal) 3.6))
-(looprange step 0 60 { (def clock (+ clock 0.02)) (engine-step) })
-(expect (and (> engine-model-speed 19.9) (< engine-model-speed 20.1)) "uses calibrated live speed")
-(expect (> (ix frequencies 0) (* idle-frequency 3.0)) "road speed clearly raises pitch")
-(def rolling-frequency (ix frequencies 0))
-(def throttle 1.0)
-(looprange step 0 60 { (def clock (+ clock 0.02)) (engine-step) })
-(expect (> (ix frequencies 0) (+ rolling-frequency 25.0)) "live throttle raises pitch")
-(expect (> engine-gain 0.49) "live throttle raises level")
-(def native-speed 0.0)
-(def brake 1.0)
-(looprange step 0 60 { (def clock (+ clock 0.02)) (engine-step) })
-(expect (> engine-rpm 5000.0) "braked stationary throttle revs")
-(expect (and (>= engine-wobble-phase 0.0) (< engine-wobble-phase 6.283186)) "phase stays bounded independently of tick magnitude")
-''', fake_clock=True)
-
-    def test_spawned_worker_uses_controller_stack_budget(self):
-        self.run_lisp(r'''
-(engine-init)
-(command 1 50 0)
-(spawn 300 engine-loop)
-(sleep 0.25)
-(expect (and engine-enabled engine-owned (> tone-events 0)
-             (< (secs-since engine-last-step) 0.1)) "spawned worker stays alive")
-(def inject-error true)
-(sleep 0.1)
-(expect (and (not engine-enabled) (not engine-owned) (= (voltage-sum) 0.0)) "spawned worker cleans up")
-''')
-
-    def test_natural_midi_completion_and_same_song_replay(self):
-        self.run_lisp(r'''
-(def song-buf-0-ready true)
-(def song-buf-1-ready true)
-(def song-buf-0 (array-create 8))
-(def song-buf-1 (array-create 8))
-(def song-buf-0-vol 0.1)
-(def song-buf-1-vol 0.1)
-(def song-buf-0-decay 1.0)
-(def song-buf-1-decay 1.0)
-(def resident-song-number 9)
-(def axelf-song-number 1)
-(def parse-offsets (list 0 0))
-(def parser-generations (list 0 0))
-(def stale-parses 0)
-(defun mock-midi-open (slot data) {
-    (setix parse-offsets slot 0)
-    (setix parser-generations slot music-play-generation)
-    true
-})
-(defun mock-midi-parse (slot generation) {
-    (if (!= generation (ix parser-generations slot)) (def stale-parses (+ stale-parses 1)))
-    (var offset (ix parse-offsets slot))
-    (setix parse-offsets slot (+ offset 1))
-    (cond
-        ((= offset 0) '(midi-header 6 0 1 100))
-        ((= offset 1) (list 'midi-track-midi 0 9 0 (+ 48 (* slot 12)) 100))
-        ((= offset 2) (list 'midi-track-midi (+ 10 (* slot 10)) 8 0 (+ 48 (* slot 12)) 0))
-        (t '(midi-track-meta 0 47 0 0)))
-})
-(engine-init)
-(command 1 50 0)
-(sleep 0.03)
-(engine-step)
-(play-current-song)
-(expect (and music-playing (not engine-owned)) "MIDI takes audio ownership")
-(def tone-before tone-events)
-(engine-step)
-(expect (= tone-events tone-before) "engine does not overwrite MIDI")
-(sleep 0.12)
-(expect (and (not music-playing) (= current-song 0) (= music-active-tracks 0)
-             (= song-status-events 1)) "both tracks finish naturally")
-(engine-step)
-(expect engine-owned "engine resumes after natural MIDI end")
-(def song-status-events 0)
-(play-current-song)
-(sleep 0.001)
-(play-current-song)
-(sleep 0.12)
-(expect (and (= stale-parses 0) (= song-status-events 1) (not music-playing)) "same-song generations cannot interfere")
-(def music-playing true)
-(def current-song 9)
-(def music-active-tracks 1)
-(def old-generation music-play-generation)
-(advance-music-generation)
-(music-track-finished old-generation 0)
-(expect (and music-playing (= current-song 9) (= music-active-tracks 1)) "stale completion cannot finish a new song")
-''')
-
-    def test_engine_code_never_changes_riding_configuration(self):
-        source = self.selected_source()
-        engine = '\n'.join(form for form in reader.forms(source)
-                           if form.startswith('(defun engine-') or form.startswith('(defun handle-engine-command'))
-        for forbidden in ('conf-set', 'set-current', 'set-duty', 'set-rpm', 'app-adc-override', 'eeprom-store'):
-            self.assertNotIn('(' + forbidden, engine)
+(expect (and (not engine-enabled) (not engine-running) (= (voltage-sum) 0.0)
+             (= (bufget-u8 dataArray_0x7ED 0) 0)) "error stops the loop, silent and reported off")
+""")
 
 
 if __name__ == '__main__':

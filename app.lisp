@@ -17,7 +17,7 @@
 (def motor-power-kw 0x03)
 (def max-speed-kmh 0x45)
 (def sw-base-version 0x10)  ; "1.0"
-(def sw-app-version 4)
+(def sw-app-version 5)
 
 (def pole-pairs 24.0)
 
@@ -318,26 +318,27 @@
 (def music-starting false)
 (def music-upload-last -100.0)
 
+; ===== Engine sound: runtime state (RAM) =====
+; An engine hum on the tone channels that follows speed and throttle, in one of
+; several styles (engine-set-style), with a start sound when it switches on and
+; a stop sound when it switches off. Off at boot, switched with Engine_Sound
+; (0x4EA). Music has priority.
 (def engine-enabled false)
-(def engine-volume 50)
-(def engine-style 0)
-(def engine-demo-playing false)
-(def engine-demo-start 0.0)
-(def engine-start-pending false)
-; Cue state: 0 steady, 1 starting, 2 stopping.
-(def engine-cue 0)
-(def engine-cue-start 0.0)
-(def engine-owned false)
-(def engine-rpm 0.0)
-(def engine-gain 0.0)
-(def engine-last-step 0.0)
-(def engine-last-status 0.0)
-(def engine-model-speed 0.0)
-(def engine-model-throttle 0.0)
-(def engine-model-brake 0.0)
-(def engine-wobble-phase 0.0)
-(def engine-tone-voltage 1.0)
-(def engine-demo-seconds 30.0)
+(def engine-running false)    ; started (start sound played), not stopped yet
+(def engine-vol-pct 50)       ; volume as set over CAN, echoed on 0x7ED
+(def engine-vol 1.0)          ; tone voltage at full load (engine-vol-pct of max)
+(def engine-style 0)          ; 0 v8, 1 moped, 2 sport, 3 vtwin, 4 electric
+(def engine-p nil)            ; the current style's parameters (engine-style-table)
+; Sound state.
+(def engine-rpm 70.0)         ; smoothed base tone
+(def engine-prev-target 70.0)
+(def engine-load 0.35)        ; smoothed loudness factor 0..1
+(def engine-shift 0)          ; ticks left in the clutch dip after an upshift
+(def engine-beat-phase 0.0)
+(def engine-rng 1)
+(def engine-sounding false)   ; engine tones are on the channels right now
+(def engine-demo false)       ; the demo ride is playing
+(def engine-last-status 0.0)  ; Engine_Status is also repeated once per second
 
 ; Music functions live in flash (@const-start/@const-end), not the RAM cell
 ; heap: upstream alone already fills about half the heap, and the music code
@@ -346,39 +347,27 @@
 @const-start
 
 ; Engine tones share the four audio channels with MIDI and sampled playback.
-; Only the audio owner may write them; songs reserve ownership before yielding.
-(defun engine-clamp (value low high)
-    (if (< value low) low (if (> value high) high value)))
+; They stay quiet while a song plays or starts, for a moment after upload
+; traffic, and while the controller reports a fault.
+(defun engine-quiet ()
+    (or music-playing music-starting (< (secs-since music-upload-last) 0.3)
+        (!= (get-fault) 0)))
 
-(defun engine-profile (style)
-    (cond
-        ((= style 1) '(1800.0 280.0 8800.0 (2.0 4.0 6.0 9.0) (0.885 0.442 0.147 0.0)))
-        ((= style 2) '(1600.0 350.0 11500.0 (4.0 8.0 12.0 16.0) (0.873 0.444 0.190 0.079)))
-        ((= style 3) '(950.0 180.0 5200.0 (3.0 4.5 7.5 10.5) (0.958 0.260 0.123 0.027)))
-        ((= style 4) '(1000.0 180.0 8000.0 (9.0 18.0 27.0 36.0) (0.965 0.241 0.096 0.024)))
-        (t '(1100.0 220.0 6200.0 (4.0 8.0 12.0 16.0) (0.884 0.402 0.225 0.096)))))
-
+; Called when a song starts or an upload begins: release the channels at once.
 (defun engine-pause () {
-    (if engine-owned {
-        (looprange channel 0 4 { (foc-play-tone channel 500.0 0.0) })
-        (def engine-owned false)
-    })
-    (def engine-gain 0.0)
+    (if engine-sounding (engine-silence-locked))
 })
 
 (defun engine-init () {
     (foc-play-stop)
     (def engine-enabled false)
-    (def engine-volume 50)
-    (def engine-style 0)
-    (def engine-demo-playing false)
-    (def engine-start-pending false)
-    (def engine-cue 0)
-    (def engine-owned false)
-    (def engine-rpm 0.0)
-    (def engine-gain 0.0)
-    (def engine-wobble-phase 0.0)
-    (def engine-last-step (systime))
+    (def engine-running false)
+    (def engine-demo false)
+    (def engine-sounding false)
+    (def engine-vol-pct 50)
+    (def engine-vol (* 0.5 (engine-vol-max)))
+    (engine-set-style 0)
+    (engine-reset)
     (def engine-last-status (systime))
     (def music-play-generation 0)
     (def music-active-tracks 0)
@@ -388,10 +377,12 @@
     (def music-upload-last -100.0)
 })
 
+; Engine_Status (0x7ED): byte 0 engine sound on/off, byte 1 volume %,
+; byte 2 demo ride playing, byte 3 style.
 (defun send-engine-status-locked () {
     (bufset-u8 dataArray_0x7ED 0 (if engine-enabled 1 0))
-    (bufset-u8 dataArray_0x7ED 1 engine-volume)
-    (bufset-u8 dataArray_0x7ED 2 (if engine-demo-playing 1 0))
+    (bufset-u8 dataArray_0x7ED 1 engine-vol-pct)
+    (bufset-u8 dataArray_0x7ED 2 (if engine-demo 1 0))
     (bufset-u8 dataArray_0x7ED 3 engine-style)
     (can-send-sid 0x7ED dataArray_0x7ED)
     (def engine-last-status (systime))
@@ -399,168 +390,440 @@
 
 (defun send-engine-status () (atomic (send-engine-status-locked)))
 
+; Engine_Sound (0x4EA): byte0 0 off (also stops the demo) / 1 on / 2 demo ride,
+; byte1 (optional) volume %, byte2 (optional) style 0..4. A command with an
+; unknown byte0 or style is ignored; a repeated on/off/demo changes nothing.
 (defun handle-engine-command (data) {
-    (if (>= (buflen data) 2) {
-        (var command (bufget-u8 data 0))
-        (var volume (engine-clamp (bufget-u8 data 1) 0 100))
-        (var style (if (>= (buflen data) 3) (bufget-u8 data 2) engine-style))
-        (if (and (<= command 2) (<= style 4))
-            (atomic {
-                (def engine-volume volume)
-                (def engine-style style)
-                (cond
-                    ((= command 0) {
-                        (var stop-cue (and engine-enabled engine-owned (not engine-demo-playing)))
-                        (def engine-enabled false)
-                        (def engine-demo-playing false)
-                        (def engine-start-pending false)
-                        (if stop-cue {
-                            (def engine-cue 2)
-                            (def engine-cue-start (systime))
-                        } {
-                            (def engine-cue 0)
-                            (engine-pause)
-                        })
-                    })
-                    ((= command 1) {
-                        (if (and (not engine-enabled) (not engine-demo-playing)) {
-                            (def engine-start-pending true)
-                            (def engine-cue 0)
-                        })
-                        (def engine-enabled true)
-                    })
-                    ((= command 2) {
-                        (if (not engine-demo-playing) {
-                            (def engine-demo-playing true)
-                            (def engine-demo-start (systime))
-                            (if (not engine-owned) (def engine-start-pending true))
-                            (def engine-cue 0)
-                        })
-                    })
-                )
-            }))
+    (var n (buflen data))
+    (var cmd (if (> n 0) (bufget-u8 data 0) 255))
+    (var style (if (> n 2) (bufget-u8 data 2) engine-style))
+    (if (and (<= cmd 2) (<= style 4)) {
+        (if (> n 1) {
+            (var pct (bufget-u8 data 1))
+            (if (> pct 100) (setq pct 100))
+            (def engine-vol-pct pct)
+            (def engine-vol (* (/ (to-float pct) 100.0) (engine-vol-max)))
+        })
+        (if (!= style engine-style) (engine-set-style style))
+        (if (= cmd 2)
+            (def engine-demo t)
+            {
+                (def engine-enabled (= cmd 1))
+                (if (= cmd 0) (def engine-demo false))
+            })
     })
     (send-engine-status)
 })
 
-; Demo inputs affect synthesis only, never ADC commands, RPM or vehicle state.
-(defun engine-demo-input (age) {
-    (def engine-model-speed 0.0)
-    (def engine-model-throttle 0.0)
-    (def engine-model-brake 0.0)
+; ===== Engine sound =====
+; One model for every style: a base tone from speed through virtual gears
+; (within each gear it climbs to engine-redline, an upshift drops it to
+; engine-shift-start of the band), four tones at fixed ratios of it, and the
+; style's character on top (an uneven firing beat, a raspy flutter). Each style
+; has its own start and stop sequence, played at 10 ms steps.
+
+; Style parameters, one constant list per style (in flash, so a style costs no
+; heap): gears; idle and redline Hz; shift-start (0..1); idle-load (loudness at
+; idle, 0..1); tones (ratio amp x4); beat divisor and gap (an uneven twin beat
+; at base/divisor Hz, second pulse at gap of the cycle; 0: none); rasp (0..1,
+; random flutter); start kind (0 starter, 1 kick, 2 power-up); crank secs,
+; crank Hz from/to, crank strokes/s from/to (starter only); flare Hz (rev flare
+; when it catches); stop kind (0 run-down, 1 rattle, 2 power-down); stop secs;
+; Hz at the end of the run-down. Tone amplitudes are scaled so every style has
+; the V8's total tone level (2.25 x engine-vol): none is louder or draws more
+; current than another.
+(defun engine-style-table (id)
     (cond
-        ((< age 1.0) nil)
-        ((< age 10.0) {
-            (def engine-model-speed (* 5.0 (- age 1.0)))
-            (def engine-model-throttle 0.85)
-        })
-        ((< age 14.0) {
-            (def engine-model-speed 45.0)
-            (def engine-model-throttle 0.2)
-        })
-        ((< age 20.0) {
-            (def engine-model-speed (* 45.0 (- 1.0 (/ (- age 14.0) 6.0))))
-            (def engine-model-brake 0.5)
-        })
-        ((< age 27.0) {
-            (def engine-model-throttle (+ 0.5 (* 0.5 (sin (* (- age 20.0) 3.0)))))
-            (def engine-model-brake 1.0)
-        })
-    )
+        ((= id 1)   ; moped: soft and low, harmonics 1-2-3 (from the Zanooda/tunu-configs moped), 4 gears, kick start
+            '(4 60.0 250.0 0.55 0.45 (1.0 1.350916 2.0 0.674695 3.0 0.224389 1.0 0.0) 0.0 0.0 0.0 1 0.0 0.0 0.0 0.0 0.0 170.0 1 1.0 25.0))
+        ((= id 2)   ; sport bike: inline four, very high revs, 6 gears
+            '(6 90.0 400.0 0.62 0.3 (0.5 0.287234 1.0 0.670213 2.0 0.957447 4.0 0.335106) 0.0 0.0 0.0 0 1.0 250.0 330.0 7.0 9.0 230.0 0 1.0 35.0))
+        ((= id 3)   ; V-twin cruiser: deep, uneven beat, 4 gears
+            '(4 55.0 120.0 0.5 0.4 (1.0 0.9 1.5 0.54 2.0 0.36 0.5 0.45) 8.0 0.35 0.0 0 2.2 110.0 160.0 2.8 3.8 95.0 0 2.4 18.0))
+        ((= id 4)   ; electric / sci-fi: no gears, smooth whine, power-up chime
+            '(1 120.0 520.0 0.0 0.25 (1.0 1.184211 2.0 0.296053 3.01 0.177632 1.005 0.592105) 0.0 0.0 0.0 2 0.0 0.0 0.0 0.0 0.0 0.0 2 0.0 0.0))
+        (t          ; V8: five gears, starter
+            '(5 70.0 170.0 0.45 0.35 (1.0 1.0 1.5 0.5 2.0 0.35 1.01 0.4) 0.0 0.0 0.0 0 1.8 150.0 230.0 4.0 6.0 125.0 0 1.8 22.0))))
+
+(defun engine-gears () (ix engine-p 0))
+(defun engine-idle () (ix engine-p 1))
+(defun engine-redline () (ix engine-p 2))
+(defun engine-shift-start () (ix engine-p 3))
+(defun engine-idle-load () (ix engine-p 4))
+(defun engine-tones () (ix engine-p 5))
+(defun engine-beat-div () (ix engine-p 6))
+(defun engine-beat-gap () (ix engine-p 7))
+(defun engine-rasp () (ix engine-p 8))
+(defun engine-start-kind () (ix engine-p 9))
+(defun engine-crank () (ix engine-p 10))
+(defun engine-crank-lo () (ix engine-p 11))
+(defun engine-crank-hi () (ix engine-p 12))
+(defun engine-crank-r0 () (ix engine-p 13))
+(defun engine-crank-r1 () (ix engine-p 14))
+(defun engine-flare () (ix engine-p 15))
+(defun engine-stop-kind () (ix engine-p 16))
+(defun engine-stop-secs () (ix engine-p 17))
+(defun engine-stop-to () (ix engine-p 18))
+
+; Hard cap for engine-vol (100 %). The engine tones sit low (70-170 Hz), where
+; the winding's impedance is lowest, so the same voltage drives more current
+; than music does; all of it is heat, none torque.
+; WARNING: don't raise this cap, and don't run the engine sound much above the
+; default 50 % for long: the extra current heats the motor windings and can
+; physically damage the motor.
+(defun engine-vol-max () 2.0)
+(defun engine-top-kmh () 46.0)
+
+(defun engine-set-style (id) {
+    (if (or (< id 0) (> id 4)) (setq id 0))
+    (def engine-p (engine-style-table id))
+    (def engine-style id)
 })
 
-(defun engine-target-rpm (profile speed throttle brake) {
-    (var ratio (cond ((< speed 10.0) 1.0) ((< speed 23.0) 0.72)
-                     ((< speed 36.0) 0.52) ((< speed 50.0) 0.40) (t 0.32)))
-    (var idle (ix profile 0))
-    (var limit (ix profile 2))
-    (var target (+ idle (* speed (ix profile 1) ratio) (* throttle 600.0)))
-    (if (and (< speed 1.0) (> brake 0.2))
-        (setq target (+ idle (* throttle (- limit idle) 0.8))))
-    (engine-clamp target idle limit)
+(defun engine-target-rpm (kmh) {
+    (var step (/ (engine-top-kmh) (engine-gears)))
+    (var gear (to-i (/ kmh step)))
+    (if (>= gear (engine-gears)) (setq gear (- (engine-gears) 1)))
+    (var frac (/ (- kmh (* gear step)) step))
+    (if (> frac 1.0) (setq frac 1.0))
+    (var start (if (> gear 0) (engine-shift-start) 0.0))
+    (+ (engine-idle) (* (- (engine-redline) (engine-idle)) (+ start (* (- 1.0 start) frac))))
 })
 
-(defun engine-step ()
-    (atomic {
-        (var now (systime))
-        (var dt (engine-clamp (secs-since engine-last-step) 0.0 0.1))
-        (def engine-last-step now)
-        (if (and engine-demo-playing (>= (secs-since engine-demo-start) engine-demo-seconds)) {
-            (def engine-demo-playing false)
-            (if (not engine-enabled) {
-                (def engine-start-pending false)
-                (def engine-cue (if engine-owned 2 0))
-                (def engine-cue-start now)
-            })
-            (send-engine-status-locked)
-        })
-        (if (or music-playing music-starting (< (secs-since music-upload-last) 0.3)
-                (!= (get-fault) 0)) {
-            (engine-pause)
-        } {
-            (if (and engine-start-pending (or engine-enabled engine-demo-playing)) {
-                (def engine-start-pending false)
-                (def engine-cue 1)
-                (def engine-cue-start now)
-            })
-            (if (and (= engine-cue 1) (>= (secs-since engine-cue-start) 0.65))
-                (def engine-cue 0))
-            (if (and (= engine-cue 2) (>= (secs-since engine-cue-start) 0.35))
-                (def engine-cue 0))
-            (if (or engine-enabled engine-demo-playing (= engine-cue 2)) {
-                (var profile (engine-profile engine-style))
-                (def engine-model-speed (abs (/ (* (get-speed) 3.6) speed-cal)))
-                (def engine-model-throttle (engine-clamp (get-adc-decoded 0) 0.0 1.0))
-                (def engine-model-brake (engine-clamp (get-adc-decoded 1) 0.0 1.0))
-                (if engine-demo-playing (engine-demo-input (secs-since engine-demo-start)))
-                (var target (engine-target-rpm profile engine-model-speed engine-model-throttle engine-model-brake))
-                (var level (* (/ (to-float engine-volume) 100.0)
-                              (+ 0.45 (* 0.55 engine-model-throttle))))
-                (var cue-age (secs-since engine-cue-start))
-                (if (= engine-cue 1) {
-                    (var factor (cond
-                        ((< cue-age 0.2) (+ 0.35 (* 3.25 cue-age)))
-                        ((< cue-age 0.4) (+ 1.0 (* 4.5 (- cue-age 0.2))))
-                        (t (- 1.9 (* 3.6 (- cue-age 0.4))))))
-                    (if (= engine-style 1)
-                        (setq factor (+ 0.45 (* 1.4 (abs (sin (* cue-age 10.0)))))))
-                    (setq target (* (ix profile 0) factor))
-                    (setq level (* (/ (to-float engine-volume) 100.0) 0.75))
-                })
-                (if (= engine-cue 2) {
-                    (var remaining (engine-clamp (- 1.0 (/ cue-age 0.35)) 0.0 1.0))
-                    (setq target (* engine-rpm remaining))
-                    (setq level (* (/ (to-float engine-volume) 100.0) 0.45 remaining))
-                })
-                (def engine-rpm (+ engine-rpm (engine-clamp (- target engine-rpm) (* -9000.0 dt) (* 9000.0 dt))))
-                (def engine-gain (+ engine-gain (engine-clamp (- level engine-gain) (* -5.0 dt) (* 5.0 dt))))
-                (def engine-wobble-phase (+ engine-wobble-phase (* dt (if (= engine-style 3) 29.0 43.0))))
-                (if (>= engine-wobble-phase 6.2831853)
-                    (def engine-wobble-phase (- engine-wobble-phase 6.2831853)))
-                (var wobble (+ 1.0 (* 0.015 (sin engine-wobble-phase))))
-                (looprange channel 0 4 {
-                    (var frequency (engine-clamp (* (/ engine-rpm 60.0) (ix (ix profile 3) channel) wobble) 70.0 5000.0))
-                    (var voltage (* engine-tone-voltage engine-gain (ix (ix profile 4) channel)))
-                    (foc-play-tone channel frequency voltage)
-                })
-                (def engine-owned true)
-            } {
-                (engine-pause)
-            })
-        })
-        (if (>= (secs-since engine-last-status) 1.0) (send-engine-status-locked))
+; Silence the engine tones on every channel the music isn't using.
+(defun engine-silence-locked () {
+    (loopforeach ch channels
+        (if (= (ix ch 1) 0) (foc-play-tone (ix ch 0) 500 0)))
+    (def engine-sounding false)
+})
+
+(defun engine-silence () (atomic (engine-silence-locked)))
+
+; Start from idle, e.g. when the sound comes back on.
+(defun engine-reset () {
+    (def engine-rpm (engine-idle))
+    (def engine-prev-target (engine-idle))
+    (def engine-load (engine-idle-load))
+    (def engine-shift 0)
+    (def engine-beat-phase 0.0)
+})
+
+; Pseudo-random 0..1 for the rasp (a small LCG: cheap, no allocation).
+(defun engine-rand () {
+    (def engine-rng (mod (+ (* engine-rng 75) 74) 65537))
+    (/ (to-float engine-rng) 65537.0)
+})
+
+; Put the style's four tones on the channels for base frequency f (Hz) and
+; loudness ld (0..1 of engine-vol), with the style's character. dt is the time
+; since the last call, for the firing beat.
+(defun engine-out (f ld dt) {
+    (var a (* engine-vol ld))
+    (if (> (engine-beat-div) 0.0) {
+        (var x (+ engine-beat-phase (* (/ f (engine-beat-div)) dt)))
+        (if (>= x 1.0) (setq x (- x 1.0)))
+        (def engine-beat-phase x)
+        (if (not (or (< x 0.2) (and (>= x (engine-beat-gap)) (< x (+ (engine-beat-gap) 0.2)))))
+            (setq a (* a 0.35)))
+    })
+    (if (> (engine-rasp) 0.0) (setq a (* a (- 1.0 (* (engine-rasp) (engine-rand))))))
+    (var tn (engine-tones))
+    (atomic (if (not (engine-quiet)) {
+        (def engine-sounding t)
+        (foc-play-tone 0 (* f (ix tn 0)) (* a (ix tn 1)))
+        (foc-play-tone 1 (* f (ix tn 2)) (* a (ix tn 3)))
+        (foc-play-tone 2 (* f (ix tn 4)) (* a (ix tn 5)))
+        (foc-play-tone 3 (* f (ix tn 6)) (* a (ix tn 7)))
     }))
+})
 
+; Explicit tones for sequence sounds that aren't the engine's tone set (starter
+; whine and thud, chime, sweep). Amplitudes are fractions of engine-vol.
+(defun engine-raw (f0 a0 f1 a1 f2 a2 f3 a3)
+    (atomic (if (not (engine-quiet)) {
+        (def engine-sounding t)
+        (foc-play-tone 0 f0 (* engine-vol a0))
+        (foc-play-tone 1 f1 (* engine-vol a1))
+        (foc-play-tone 2 f2 (* engine-vol a2))
+        (foc-play-tone 3 f3 (* engine-vol a3))
+    })))
+
+; Can a sequence step run? mode 0: start (while switched on), 1: stop (while
+; switched off), 2: demo (while the demo runs). A song, an upload or a fault
+; always wins.
+(defun engine-report-if-due ()
+    (if (>= (secs-since engine-last-status) 1.0) (send-engine-status)))
+
+(defun engine-seq-ok (mode) {
+    (engine-report-if-due)
+    (and (not (engine-quiet))
+         (cond ((= mode 0) (and engine-enabled (not engine-demo)))
+               ((= mode 1) (and (not engine-enabled) (not engine-demo)))
+               (t engine-demo)))
+})
+
+(defun engine-in (x lst) {
+    (var found nil)
+    (loopforeach el lst (if (= el x) { (setq found t) (break) }))
+    found
+})
+
+; The engine catching: revs flare from f towards (engine-flare) (with misfires
+; at the given steps), then settle to idle.
+(defun engine-catch (mode f k steps misfires settle-n settle-k load-k) {
+    (var ok t)
+    (looprange i 0 steps {
+        (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+        (setq f (+ f (* (- (engine-flare) f) k)))
+        (engine-out f (if (engine-in i misfires) 0.15 1.0) 0.01)
+        (sleep 0.01)
+    })
+    (var ld 1.0)
+    (if ok (looprange i 0 settle-n {
+        (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+        (setq f (+ f (* (- (engine-idle) f) settle-k)))
+        (setq ld (+ ld (* (- (engine-idle-load) ld) load-k)))
+        (engine-out f ld 0.01)
+        (sleep 0.01)
+    }))
+    ok
+})
+
+; Starter: a whine rising over the crank, pulsing with the compression strokes,
+; a low thud on each; then the engine catches.
+(defun engine-start-starter (mode) {
+    (var ok t)
+    (looprange i 0 (to-i (/ (engine-crank) 0.01)) {
+        (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+        (var tt (* i 0.01))
+        (var rate (+ (engine-crank-r0) (* (- (engine-crank-r1) (engine-crank-r0)) (/ tt (engine-crank)))))
+        (var ph (* tt rate))
+        (setq ph (- ph (to-float (to-i ph))))
+        (var pulse (+ 0.55 (* 0.45 (abs (sin (* 3.14159 ph))))))
+        (var fs (+ (engine-crank-lo) (* (- (engine-crank-hi) (engine-crank-lo)) (/ tt (engine-crank)))))
+        (var thud (if (< ph 0.12) 0.9 0.0))
+        (engine-raw fs (* 0.45 pulse) (* fs 2.02) (* 0.15 pulse) 42.0 thud 63.0 (* 0.4 thud))
+        (sleep 0.01)
+    })
+    (if ok (engine-catch mode (* (engine-idle) 0.6) 0.13 50 '(3 8 14 21) 120 0.045 0.04) ok)
+})
+
+; Kick start: one kick that dies, a pause, a second kick that catches.
+(defun engine-start-kick (mode) {
+    (var ok t)
+    (looprange kick 0 2 {
+        (looprange i 0 30 {
+            (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+            (var x (/ (to-float i) 30.0))
+            (var y (* x 1.6))
+            (engine-out (+ 50.0 (* 110.0 (sin (* 3.14159 (if (> y 1.0) 1.0 y))))) (+ 0.1 (* 0.8 (- 1.0 x))) 0.01)
+            (sleep 0.01)
+        })
+        (if (not ok) (break))
+        (if (= kick 0) { (engine-silence) (sleep 0.45) })
+    })
+    (if ok (engine-catch mode 150.0 0.15 45 '(4 10 17) 100 0.05 0.05) ok)
+})
+
+; Power-up: a rising sweep, a two-tone chime, then down to the idle hum.
+(defun engine-start-powerup (mode) {
+    (var ok t)
+    (looprange i 0 60 {
+        (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+        (var x (/ (to-float i) 60.0))
+        (var f (+ 200.0 (* 700.0 x x)))
+        (engine-raw f (+ 0.1 (* 0.6 x)) (* f 1.5) (* 0.2 x) 500.0 0.0 500.0 0.0)
+        (sleep 0.01)
+    })
+    (loopforeach nt '((880.0 12) (1320.0 22)) {
+        (var amp 0.8)
+        (if ok (looprange i 0 (ix nt 1) {
+            (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+            (engine-raw (ix nt 0) amp (* (ix nt 0) 2.0) (* amp 0.25) 500.0 0.0 500.0 0.0)
+            (setq amp (* amp 0.97))
+            (sleep 0.01)
+        }))
+    })
+    (var f 600.0)
+    (var ld 0.6)
+    (if ok (looprange i 0 80 {
+        (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+        (setq f (+ f (* (- (engine-idle) f) 0.06)))
+        (setq ld (+ ld (* (- (engine-idle-load) ld) 0.06)))
+        (engine-out f ld 0.01)
+        (sleep 0.01)
+    }))
+    ok
+})
+
+; Start sound of the current style. Returns nil if it was cut short.
+(defun engine-start-seq (mode) {
+    (var ok (cond
+        ((= (engine-start-kind) 1) (engine-start-kick mode))
+        ((= (engine-start-kind) 2) (engine-start-powerup mode))
+        (t (engine-start-starter mode))))
+    (engine-reset)
+    ok
+})
+
+; Stop sound of the current style: the revs run down and get rougher (a
+; rattle for the moped) and end in a thump, or a power-down sweep.
+(defun engine-stop-seq (mode) {
+    (var ok t)
+    (if (= (engine-stop-kind) 2)
+        (looprange i 0 100 {
+            (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+            (var x (/ (to-float i) 100.0))
+            (var f (+ (* 450.0 (- 1.0 x)) (* 50.0 x)))
+            (engine-raw f (* 0.6 (- 1.0 x)) (* f 1.5) (* 0.2 (- 1.0 x)) 500.0 0.0 500.0 0.0)
+            (sleep 0.01)
+        })
+        {
+            (var n (to-i (/ (engine-stop-secs) 0.01)))
+            (looprange i 0 n {
+                (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+                (var x (/ (to-float i) (to-float n)))
+                (var y (- 1.0 x))
+                (var f (- (engine-idle) (* (- (engine-idle) (engine-stop-to)) (- 1.0 (* y y)))))
+                (var rough (+ 0.15 (* 0.6 x)))
+                (var flutter (if (= (engine-stop-kind) 1)
+                    (- 1.0 (* rough (engine-rand)))
+                    (- 1.0 (* rough (+ 0.5 (* 0.5 (sin (* 6.28318 (/ f 18.0) (to-float i) 0.06))))))))
+                (engine-out f (* (engine-idle-load) (- 1.0 (* 0.5 x)) flutter) 0.01)
+                (sleep 0.01)
+            })
+            (var amp 0.9)
+            (if ok (looprange i 0 9 {
+                (if (not (engine-seq-ok mode)) { (setq ok nil) (break) })
+                (engine-raw 38.0 amp 57.0 (/ amp 3.0) 500.0 0.0 500.0 0.0)
+                (setq amp (* amp 0.7))
+                (sleep 0.01)
+            }))
+        })
+    (engine-silence)
+    ok
+})
+
+; One 20 ms step of the sound for a speed (km/h), throttle and brake (0..1).
+; Standing still with the brake pressed, the throttle revs the engine freely,
+; as if in neutral: up quickly, down slowly like a flywheel. Sound only: the
+; ADC app's own brake handling keeps the motor still.
+(defun engine-tick (kmh thr brk) {
+    (var want (engine-idle-load))
+    (if (and (< kmh 1.0) (> brk 0.3)) {
+        (var target (+ (engine-idle) (* (- (engine-redline) (engine-idle)) 0.95 thr)))
+        (def engine-prev-target (engine-idle))
+        (def engine-shift 0)
+        (def engine-rpm (+ engine-rpm (* (- target engine-rpm) (if (> target engine-rpm) 0.3 0.06))))
+        (setq want (+ (engine-idle-load) (* (- 1.0 (engine-idle-load)) thr)))
+    } {
+        (var net (- thr brk))
+        (if (< net 0.0) (setq net 0.0))
+        (var target (engine-target-rpm kmh))
+        ; A sudden drop of the target is an upshift: dip the load like a clutch.
+        (if (< target (* engine-prev-target 0.9)) (def engine-shift 9))
+        (def engine-prev-target target)
+        ; Revs fall over ~0.15 s on an upshift instead of jumping.
+        (def engine-rpm (+ engine-rpm (* (- target engine-rpm) (if (< target engine-rpm) 0.13 0.35))))
+        (setq want (+ (engine-idle-load) (* (- 1.0 (engine-idle-load)) net)))
+        (if (> engine-shift 0) {
+            (setq want (* want 0.35))
+            (def engine-shift (- engine-shift 1))
+        })
+    })
+    (def engine-load (+ engine-load (* (- want engine-load) 0.2)))
+    (engine-out engine-rpm engine-load 0.02)
+})
+
+(defun engine-clamp (x) (if (< x 0.0) 0.0 (if (> x 1.0) 1.0 x)))
+
+; 50 Hz loop. Switching on plays the start sound, switching off the stop sound.
+; While a song plays (or starts, or uploads) or the controller reports a fault,
+; the engine stays silent and resumes without a new start sound; the music's
+; own note-on/decay-loop own the channels then. Start, stop and demo sequences
+; all run on this worker, so only one renderer owns the tones and model state.
+; Engine_Status is repeated once per second, including during sequences.
+(defun engine-step () {
+    (cond
+        (engine-demo (engine-demo-run))
+        ((and engine-enabled (not (engine-quiet))) {
+            (if (not engine-running) {
+                (def engine-running t)
+                (engine-start-seq 0)
+            })
+            (atomic (if (or engine-demo (engine-quiet)) (engine-pause)))
+            (if (not engine-sounding) (engine-reset))
+            (if (and engine-enabled (not engine-demo) (not (engine-quiet))) {
+                (engine-tick (/ (* (abs (get-speed)) 3.6) speed-cal)
+                             (engine-clamp (get-adc-decoded 0))
+                             (engine-clamp (get-adc-decoded 1)))
+            })
+        })
+        ((and (not engine-enabled) engine-running) {
+            (if (not (engine-quiet)) (engine-stop-seq 1))
+            (def engine-running nil)
+            (engine-silence)
+            (def engine-sounding nil)
+        })
+        (engine-sounding {
+            (engine-silence)
+            (def engine-sounding nil)
+        }))
+    (engine-report-if-due)
+})
+
+; If the loop ever stops with an error, it releases the channels and reports off.
 (defun engine-loop () {
     (var result (trap (loopwhile t { (engine-step) (sleep 0.02) })))
     (atomic {
         (engine-pause)
         (def engine-enabled false)
-        (def engine-demo-playing false)
-        (def engine-cue 0)
+        (def engine-running false)
+        (def engine-demo false)
     })
     (send-engine-status)
     (print (list "Engine sound stopped" result))
+})
+
+; One segment of the demo ride: move the simulated speed towards target-kmh at
+; accel km/h per second for secs seconds, with the throttle at thr. Returns the
+; speed reached. Ends early when the demo is stopped or a song starts.
+(defun engine-demo-seg (kmh secs target-kmh accel thr) {
+    (var step (* accel 0.02))
+    (looprange i 0 (to-i (* secs 50.0))
+        (if (engine-seq-ok 2) {
+            (var d (- target-kmh kmh))
+            (setq kmh (+ kmh (if (> d step) step (if (< d (- 0.0 step)) (- 0.0 step) d))))
+            (engine-tick kmh thr 0.0)
+            (sleep 0.02)
+        } (break)))
+    kmh
+})
+
+; Demo, ~30 s: start sound, idle, full throttle to 45 km/h, cruise, roll off,
+; brake to a stop, idle, stop sound. Same sound code as a real ride.
+(defun engine-demo-ride () {
+    (engine-reset)
+    (def engine-demo t)
+    (send-engine-status)
+    (if (engine-start-seq 2) {
+        (var v 0.0)
+        (setq v (engine-demo-seg v 2.0 0.0 5.0 0.0))
+        (setq v (engine-demo-seg v 9.0 45.0 6.0 1.0))
+        (setq v (engine-demo-seg v 4.0 45.0 2.0 0.35))
+        (setq v (engine-demo-seg v 3.0 30.0 5.0 0.0))
+        (setq v (engine-demo-seg v 3.0 0.0 14.0 0.0))
+        (engine-demo-seg v 2.0 0.0 5.0 0.0)
+        (if (engine-seq-ok 2) (engine-stop-seq 2))
+    })
+})
+
+(defun engine-demo-run () {
+    (trap (engine-demo-ride))
+    (def engine-demo false)
+    (engine-silence)
+    (def engine-sounding false)
+    (send-engine-status)
 })
 
 (defun advance-music-generation ()
