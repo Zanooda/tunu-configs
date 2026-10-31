@@ -353,7 +353,9 @@ def upgrade_existing_app(source, song_number):
         if upload.count(old) != 1:
             raise ValueError("ambiguous upload stop hook")
         source = replace_defun(source, "handle-upload-begin", upload.replace(old, fixed))
-    elif fixed not in upload:
+    elif fixed not in upload and not re.search(
+            r'\(if\s+\(or music-playing music-starting\)\s*\{\s*'
+            r'\(stop-music\)\s*\(send-music-status\)\s*\}\)', upload):
         raise ValueError("unrecognized upload stop hook")
     return source
 

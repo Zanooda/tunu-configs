@@ -78,7 +78,9 @@ class PrivateBuilderTests(unittest.TestCase):
 
     def test_upgrade_existing_pcm_preserves_target_and_applies_merged_upload_fix(self):
         original = builder.injected_app(self.default_source).replace('(def warp-song-number 240)', '(def warp-song-number 7)')
-        original = original.replace('(if (or music-playing music-starting) (stop-music))', '(if music-playing (stop-music))')
+        original = re.sub(r'\(if\s+\(or music-playing music-starting\)\s*\{\s*'
+                          r'\(stop-music\)\s*\(send-music-status\)\s*\}\)',
+                          '(if music-playing (stop-music))', original)
         original = original.replace('(def shutdown-threshold 2.48)', '(def shutdown-threshold 2.50)')
         updated = builder.upgrade_existing_app(original, 240)
         self.assertIn('(def warp-song-number 240)', updated)
@@ -89,6 +91,14 @@ class PrivateBuilderTests(unittest.TestCase):
             builder.upgrade_existing_app(self.default_source, 240)
         with self.assertRaisesRegex(ValueError, 'song number'):
             builder.upgrade_existing_app(original, 239)
+
+    def test_pcm_upgrade_preserves_new_upload_status_hook(self):
+        original = builder.injected_app(self.default_source)
+        updated = builder.upgrade_existing_app(original, 255)
+        self.assertIn('(def warp-song-number 255)', updated)
+        self.assertEqual(builder.extract_defun(original, 'handle-upload-begin'),
+                         builder.extract_defun(updated, 'handle-upload-begin'))
+        self.assertIn('(send-music-status)', builder.extract_defun(updated, 'handle-upload-begin'))
 
     def test_custom_target_logic_is_preserved_and_music_mismatch_rejected(self):
         custom = self.default_source.replace('(def shutdown-threshold 2.48)', '(def shutdown-threshold 2.50)')

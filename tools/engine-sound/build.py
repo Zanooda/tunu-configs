@@ -9,9 +9,11 @@ import re
 import shutil
 
 REPO = Path(__file__).resolve().parents[2]
-MUSIC_STATE = {'music-play-generation', 'music-active-tracks', 'music-starting', 'music-upload-last'}
+MUSIC_STATE = {'music-play-generation', 'music-active-tracks', 'music-starting', 'music-upload-last',
+               'music-start-count', 'music-end-reason'}
 MUSIC_FUNCTIONS = ('advance-music-generation', 'music-generation-current', 'music-track-finished',
-                   'play-midi-track', 'stop-music', 'play-current-song', 'play-axelf', 'note-on', 'note-off')
+                   'play-midi-track', 'stop-music', 'play-current-song', 'play-axelf', 'note-on', 'note-off',
+                   'send-music-status')
 PROTECTED_FUNCTIONS = ('check-shutdown', 'send-status2', 'send_stats', 'kers-fade-target',
                        'update-kers-fade', 'kers-voltage-scale', 'update-kers-current')
 
@@ -49,9 +51,9 @@ def add_engine(source, canonical=None, upgrade=False):
     before_imports = flash.source_imports(source.encode())
     states = []
     for line in canonical.splitlines():
-        match = re.fullmatch(r'\(def ([A-Za-z0-9_-]+) .+\)', line)
+        match = re.fullmatch(r'\(def ([A-Za-z0-9_-]+) .+\)(?:\s*;[^\n]*)?', line)
         if match and (match[1].startswith('engine-') or match[1] in MUSIC_STATE):
-            existing = re.findall(r'^\(def ' + re.escape(match[1]) + r'\s.+\)$', source, re.M)
+            existing = re.findall(r'^\(def ' + re.escape(match[1]) + r'\s.+\)(?:[ \t]*;[^\n]*)?$', source, re.M)
             if len(existing) > 1:
                 raise ValueError('duplicate state: ' + match[1])
             if existing and upgrade and match[1].startswith('engine-'):
@@ -73,8 +75,9 @@ def add_engine(source, canonical=None, upgrade=False):
             source = warp.replace_defun(source, name, definition)
         else:
             additions.append(definition)
-    source = replace_once(source, '; ===== Music: polyphony engine =====',
-                          '\n\n'.join(additions) + '\n\n; ===== Music: polyphony engine =====')
+    if additions:
+        source = replace_once(source, '; ===== Music: polyphony engine =====',
+                              '\n\n'.join(additions) + '\n\n; ===== Music: polyphony engine =====')
     if not has_engine:
         for name in ('handle-upload-begin', 'handle-upload-chunk', 'handle-upload-end'):
             definition = warp.extract_defun(source, name)
@@ -96,6 +99,18 @@ def add_engine(source, canonical=None, upgrade=False):
                               '    (spawn 200 decay-loop)\n    (spawn 300 engine-loop)\n')
         source = replace_once(source, '(list abs loopforeach looprange loopwhile)',
                               '(list abs sin loopforeach looprange loopwhile)')
+    source, buffers = re.subn(r'\(def dataArray_0x7E6 \(array-create (?:3|5)\)\)',
+                              '(def dataArray_0x7E6 (array-create 5))', source)
+    if buffers != 1:
+        raise ValueError('expected one music status buffer')
+    upload = warp.extract_defun(source, 'handle-upload-begin')
+    stop_hook = '(if (or music-playing music-starting) (stop-music))'
+    status_hook = '(if (or music-playing music-starting) {\n            (stop-music)\n            (send-music-status)\n        })'
+    if stop_hook in upload:
+        source = warp.replace_defun(source, 'handle-upload-begin',
+                                    replace_once(upload, stop_hook, status_hook))
+    elif status_hook not in upload:
+        raise ValueError('unrecognized upload stop/status hook')
     app_version = re.search(r'^\(def sw-app-version ([0-9]+)\)$', canonical, re.M)
     if not app_version:
         raise ValueError('canonical app version is missing')

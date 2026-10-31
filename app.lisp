@@ -164,12 +164,20 @@
 ;   byte0: play state (0 = stopped, 1 = playing)
 ;   byte1: current song number (0 if stopped)
 ;   byte2: master volume, 0..100 %
+;   byte3: start counter, +1 (mod 256) on every song start, so the MDB can
+;          tell a start from a volume reply; restarts at 0 on every boot
+;   byte4: why the last song ended: 0 still playing / none, 1 stopped,
+;          2 finished
+; It is also sent when a song finishes on its own, and when an upload stops a
+; playing song.
 ;
 ; Upload completion echoes on Music_Upload_Status (0x7E7):
 ;   byte0: song number, byte1: track slot, byte2: result
 ;     (0 OK, 1 checksum mismatch, 2 length mismatch, 3 rejected)
 ;   byte3: reserved
 (def music-master-vol 1.0)   ; 0.0-1.0 global multiplier, set live via 0x4E9
+(def music-start-count 0)    ; echoed on 0x7E6 byte3
+(def music-end-reason 0)     ; echoed on 0x7E6 byte4: 0 none, 1 stopped, 2 finished
 
 ; Build and send ECU_status4 (0x7E3) reflecting current KERS state
 (defun send-status4 (ebs-en gear-en) {
@@ -202,10 +210,13 @@
 ;   byte 0: play state (0 = stopped, 1 = playing)
 ;   byte 1: current song number (0 if stopped)
 ;   byte 2: master volume, 0..100 %
+;   byte 3: start counter, byte 4: end reason (see the protocol notes above)
 (defun send-music-status () {
     (bufset-u8 dataArray_0x7E6 0 (if music-playing 1 0))
     (bufset-u8 dataArray_0x7E6 1 (if music-playing current-song 0))
     (bufset-u8 dataArray_0x7E6 2 (to-i (* music-master-vol 100.0)))
+    (bufset-u8 dataArray_0x7E6 3 music-start-count)
+    (bufset-u8 dataArray_0x7E6 4 music-end-reason)
     (can-send-sid 0x7E6 dataArray_0x7E6)
 })
 
@@ -571,6 +582,7 @@
             (def current-song 0)
             (def music-playing false)
             (def music-starting false)
+            (def music-end-reason 2)
             (foc-play-stop)
             (loopforeach ch channels { (setix ch 1 0) })
             (send-music-status)
@@ -623,11 +635,14 @@
 ; ===== Music: playback =====
 
 ; The song and generation are captured at spawn time; both must still own playback.
-(defun play-midi-track (parser-idx volts decay song-id generation) {
+; Streamed songs play from file time 0, so all tracks share one time zero and a
+; track that enters later stays in time. trim skips this track's own lead-in
+; instead, for the package-imported Axel F.
+(defun play-midi-track (parser-idx volts decay song-id generation trim) {
     (var t-delta 0.0)
     (var midi-tdiv 100)
     (var midi-tempo 400000)
-    (var t-offset -1.0)  ; set on first note to skip any silent intro
+    (var t-offset (if trim -1.0 0.0))  ; -1: set on the first event
     (loopwhile (and (= current-song song-id) (music-generation-current generation))
         (match (atomic (if (music-generation-current generation) (ext-midi-parse parser-idx) 'midi-eob))
             ((midi-header (? size) (? format) (? tracks) (? time-div)) {
@@ -667,6 +682,7 @@
 (defun stop-music () {
     (var generation (advance-music-generation))
     (atomic (if (music-generation-current generation) {
+        (if music-playing (def music-end-reason 1))
         (def current-song 0)
         (def music-playing false)
         (def music-starting false)
@@ -700,8 +716,10 @@
             (def music-t-start (systime))
             (def current-song resident-song-number)
             (def music-playing true)
-            (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number generation))
-            (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number generation))
+            (def music-start-count (mod (+ music-start-count 1) 256))
+            (def music-end-reason 0)
+            (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number generation false))
+            (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number generation false))
         } {
             (print "No song buffer ready to play")
         })
@@ -731,8 +749,10 @@
         (def current-song axelf-song-number)
         (def music-playing true)
         (def music-starting false)
-        (spawn 200 play-midi-track 0 2 0.92 axelf-song-number generation)
-        (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number generation)
+        (def music-start-count (mod (+ music-start-count 1) 256))
+        (def music-end-reason 0)
+        (spawn 200 play-midi-track 0 2 0.92 axelf-song-number generation true)
+        (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number generation true)
     }))
 })
 
@@ -754,7 +774,11 @@
     } {
         ; The buffers about to be refilled may be mid-playback — stop first,
         ; or a play-midi-track thread would read them while they're rewritten.
-        (if (or music-playing music-starting) (stop-music))
+        ; Report it, so the MDB sees the song end (stopped).
+        (if (or music-playing music-starting) {
+            (stop-music)
+            (send-music-status)
+        })
         ; A new song number clears BOTH track-ready flags, so a mono song
         ; doesn't inherit a stale second track from a previous song.
         (if (!= song-number resident-song-number) {
@@ -1099,7 +1123,7 @@
     (def dataArray_0x7E3 (array-create 8))
     (def dataArray_0x7E4 (array-create 8))
     (def dataArray_0x7E5 (array-create 4))
-    (def dataArray_0x7E6 (array-create 3))   ; music: Music_Status
+    (def dataArray_0x7E6 (array-create 5))   ; music: Music_Status
     (def dataArray_0x7E7 (array-create 4))   ; music: Music_Upload_Status
     (def dataArray_0x7E8 (array-create 8))
     (def dataArray_0x7E9 (array-create 2))

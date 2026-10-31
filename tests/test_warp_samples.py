@@ -109,6 +109,8 @@ def private_runtime_source(source, repl):
 
     prelude = r'''
 (def music-play-generation 0)
+(def music-start-count 0)
+(def music-end-reason 0)
 (def current-song 0)
 (def music-playing false)
 (def music-starting false)
@@ -160,7 +162,7 @@ def private_runtime_source(source, repl):
   (atomic (if (= slot 0) (setq gen-a value) (setq gen-b value)))
 })
 (defun engine-pause () true)
-(defun play-midi-track (parser volume decay song generation) true)
+(defun play-midi-track (parser volume decay song generation trim) true)
 (defun reset-test-state () {
   (setq music-play-generation 0)
   (setq current-song 0)

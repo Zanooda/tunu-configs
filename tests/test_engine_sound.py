@@ -29,6 +29,8 @@ PRELUDE = r'''
 (def current-song 0)
 (def music-t-start (systime))
 (def music-master-vol 0.5)
+(def music-start-count 0)
+(def music-end-reason 0)
 (def channels (map (fn (x) (list x 0 0 0 0)) (range 4)))
 (def dataArray_0x7ED (array-create 4))
 (def status-events 0)
