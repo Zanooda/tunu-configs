@@ -15,5 +15,5 @@ concurrency = "drop"
 
   [[rule.step]]
   do = "exec"
-  command = "/data/extensions/warp-sound.py"
+  command = "/data/extensions/warp-sound"
   timeout = "5s"

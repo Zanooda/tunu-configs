@@ -4,10 +4,12 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import struct
+import subprocess
 import wave
 
 REPO = Path(__file__).resolve().parents[2]
@@ -360,6 +362,29 @@ def upgrade_existing_app(source, song_number):
     return source
 
 
+def stage_trigger(extension_dir, song_number, trigger_binary=None, go="go"):
+    if not PCM_MIN_ID <= song_number <= PCM_MAX_ID:
+        raise ValueError("sample song number must be in the range 240-255")
+    binary = extension_dir / "bin/tunu-warp-trigger"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    if trigger_binary is None:
+        env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH="arm", GOARM="7", GOWORK="off")
+        subprocess.run([go, "build", "-trimpath", "-ldflags", "-s -w", "-o", str(binary), "."],
+                       cwd=REPO / "extensions/warp-trigger", env=env, check=True, timeout=120)
+    else:
+        shutil.copyfile(trigger_binary, binary)
+    header = binary.read_bytes()[:52]
+    if (len(header) < 52 or header[:6] != b"\x7fELF\x01\x01"
+            or struct.unpack_from("<H", header, 16)[0] not in (2, 3)
+            or struct.unpack_from("<H", header, 18)[0] != 40):
+        raise ValueError("trigger binary must be a little-endian ARM32 ELF executable")
+    binary.chmod(0o755)
+    wrapper = extension_dir / "warp-sound"
+    wrapper.write_text("#!/bin/sh\nexec /data/extensions/bin/tunu-warp-trigger --song-number %d\n" % song_number)
+    wrapper.chmod(0o755)
+    shutil.copy2(REPO / "extensions/warp-sound.toml", extension_dir / "warp-sound.toml")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -378,6 +403,9 @@ def parse_args():
                         help="move a recognized legacy sample entry at 7 in the staged catalogue")
     parser.add_argument("--base-catalog", type=Path, required=True,
                         help="existing songs.json to preserve and stage the sample entry")
+    parser.add_argument("--trigger-binary", type=Path,
+                        help="prebuilt ARM32 native trigger (default: cross-build with Go)")
+    parser.add_argument("--go", default="go", help="Go executable for the native trigger build")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="private output directory outside the repository")
     return parser.parse_args()
@@ -456,12 +484,7 @@ def main():
     (stage / "songs.json").write_text(json.dumps(catalog, indent=2) + "\n")
     extension_dir = output / "bundle/extensions"
     extension_dir.mkdir(parents=True, exist_ok=True)
-    trigger = (REPO / "extensions/warp-sound.py").read_text()
-    old_number = "SONG_NUMBER = 240"
-    if trigger.count(old_number) != 1:
-        raise ValueError("expected one default trigger song number")
-    (extension_dir / "warp-sound.py").write_text(trigger.replace(old_number, "SONG_NUMBER = %d" % args.song_number))
-    shutil.copy2(REPO / "extensions/warp-sound.toml", extension_dir / "warp-sound.toml")
+    stage_trigger(extension_dir, args.song_number, args.trigger_binary, args.go)
     limit = flash.MAX_IMAGE_SIZE
     if len(image) > limit:
         raise ValueError("private image exceeds VESC image capacity")

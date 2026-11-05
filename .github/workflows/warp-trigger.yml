@@ -1,0 +1,37 @@
+name: Warp trigger
+
+on:
+  pull_request:
+    paths:
+      - 'extensions/warp-trigger/**'
+      - 'extensions/warp-sound*'
+      - 'tools/warp-sound/**'
+      - 'tests/*warp*'
+      - '.github/workflows/warp-trigger.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'extensions/warp-trigger/**'
+      - 'extensions/warp-sound*'
+      - 'tools/warp-sound/**'
+      - 'tests/*warp*'
+      - '.github/workflows/warp-trigger.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tests/warp_policy_cases.py > "$RUNNER_TEMP/warp-policy.json"
+      - run: WARP_POLICY_CASES="$RUNNER_TEMP/warp-policy.json" go test -race ./... && go vet ./...
+        working-directory: extensions/warp-trigger
+      - run: GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o "$RUNNER_TEMP/tunu-warp-trigger" .
+        working-directory: extensions/warp-trigger
+      - run: python3 -m unittest discover -s tests -p 'test_warp_sound.py' -v
+      - run: python3 -m unittest discover -s tests -p 'test_warp_private_builder.py' -v

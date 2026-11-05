@@ -7,8 +7,11 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import tempfile
+import tomllib
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -48,6 +51,58 @@ class PrivateBuilderTests(unittest.TestCase):
                       builder.PRIVATE_FUNCTIONS["play-current-song"])
         self.assertIn("(var generation (advance-music-generation))",
                       builder.PRIVATE_FUNCTIONS["play-axelf"])
+
+    @staticmethod
+    def arm_elf():
+        header = bytearray(52)
+        header[:6] = b"\x7fELF\x01\x01"
+        struct.pack_into("<HH", header, 16, 2, 40)
+        return bytes(header)
+
+    def test_staged_trigger_uses_native_binary_and_selected_song(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            supplied = root / "trigger"
+            supplied.write_bytes(self.arm_elf())
+            output = root / "extensions"
+            builder.stage_trigger(output, 255, supplied)
+            binary = output / "bin/tunu-warp-trigger"
+            self.assertEqual(binary.read_bytes(), supplied.read_bytes())
+            self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o755)
+            wrapper = output / "warp-sound"
+            self.assertIn("--song-number 255", wrapper.read_text())
+            self.assertNotIn("python", wrapper.read_text())
+            self.assertEqual(stat.S_IMODE(wrapper.stat().st_mode), 0o755)
+            rule = tomllib.loads((output / "warp-sound.toml").read_text())["rule"][0]
+            self.assertFalse(rule["enabled"])
+            self.assertEqual(rule["step"][0]["command"], "/data/extensions/warp-sound")
+            self.assertFalse((output / "warp-sound.py").exists())
+
+    def test_trigger_cross_build_has_explicit_target_and_bounded_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            def build(args, **kwargs):
+                self.assertEqual(args[0], "/opt/go/bin/go")
+                self.assertEqual(kwargs["cwd"], ROOT / "extensions/warp-trigger")
+                self.assertEqual({key: kwargs["env"][key] for key in ("GOOS", "GOARCH", "GOARM", "CGO_ENABLED", "GOWORK")},
+                                 {"GOOS": "linux", "GOARCH": "arm", "GOARM": "7", "CGO_ENABLED": "0", "GOWORK": "off"})
+                self.assertTrue(kwargs["check"])
+                self.assertEqual(kwargs["timeout"], 120)
+                Path(args[args.index("-o") + 1]).write_bytes(self.arm_elf())
+            with patch.object(builder.subprocess, "run", side_effect=build) as run:
+                builder.stage_trigger(output, 240, go="/opt/go/bin/go")
+                run.assert_called_once()
+
+    def test_trigger_rejects_wrong_architecture_and_invalid_song(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            supplied = root / "trigger"
+            for data in (b"bad", self.arm_elf()[:20], self.arm_elf()[:18] + struct.pack("<H", 62) + self.arm_elf()[20:]):
+                supplied.write_bytes(data)
+                with self.assertRaisesRegex(ValueError, "ARM32 ELF"):
+                    builder.stage_trigger(root / "extensions", 240, supplied)
+            with self.assertRaisesRegex(ValueError, "240-255"):
+                builder.stage_trigger(root / "extensions", 7, supplied)
 
     def test_existing_sample_catalog_entry_is_preserved(self):
         existing = {"number": 240, "name": "Space Whoosh", "source": "builtin-samples", "default": "tng-warp2"}
