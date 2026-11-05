@@ -6,6 +6,31 @@ The generic `app.lisp` keeps sample playback disabled and imports no private aud
 
 The helper invalidates its baseline and arming after stale, out-of-order, mismatched or invalid observations, so a crossing needs a recent matching predecessor observed by this helper. This bounds the observation chain but cannot identify a reconnect that occurs within the one-second window. Keep the rule disabled until deployment review confirms event continuity and target runtime behavior.
 
+## Native handler for speed events
+
+Use `warp-trigger/` for enabled, high-frequency speed rules. It implements the
+same observation policy as the Python helper, without starting Python or
+`redis-cli` for each event. Each invocation uses one Redis connection with a
+200 ms connect timeout and a 400 ms total command deadline. It keeps the same
+state key, 50 km/h crossing, 45 km/h rearm and 45-second cooldown.
+
+```sh
+cd extensions/warp-trigger
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags '-s -w' -o tunu-warp-trigger .
+go test -race ./...
+go vet ./...
+```
+
+Install the binary as `/data/extensions/bin/tunu-warp-trigger` and change the
+existing rule's `command` to that path. Keep `concurrency = "drop"` and the
+existing timeout; restart only `librescoot-events` after changing its rule.
+Back up the rule first and verify it loads. The binary defaults to resident
+song 240; a different prepared resident number can be selected with
+`--song-number` in an executable wrapper. `--state-key` and `--music-channel`
+allow isolated diagnostics without modifying the real latch or sending music
+commands. The Python helper remains available as a policy reference and
+fallback; do not run both handlers for the same input.
+
 Offline tests:
 
 ```sh
