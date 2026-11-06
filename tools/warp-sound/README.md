@@ -90,6 +90,13 @@ python3 tools/warp-sound/build_private.py \
 
 Alternatively, use `--source-audio "$SOURCE_AUDIO"` instead of `--sample-stream` to convert during the build. The expected digest is optional for the builder; when omitted, it prints the converted sample digest. `--sample-sha256` verifies a previously recorded digest.
 
+The builder cross-compiles the native event trigger with Go 1.21 or newer.
+Use `--go /path/to/go` when Go is not on PATH, or pass `--trigger-binary` with
+an existing ARM32 build. The staged extension includes the native binary, an
+executable wrapper carrying the selected song number, and the disabled rule.
+It does not start Python for speed events. Install the wrapper and `bin/`
+contents along with the rule; staging does not enable it.
+
 The player defaults to song 240. Pass `--song-number` to select another reserved number from 240 to 255. The builder preserves an existing trackless `builtin-samples` entry at that number and refuses to overwrite any conflicting entry. A recognized legacy sample at song 7 requires the explicit `--migrate-legacy` option; migrate the controller image, staged catalogue and staged trigger together. Existing controller images continue using their previous number until updated. It injects sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle. `--app-source` uses the captured target source instead of the generic repository app. The source must contain all PCM insertion points and its shared music functions must match the reviewed repository implementation; otherwise the builder refuses to continue. All imports in the source must be present in the backup and match its recorded hashes. For an existing sampled app, use `--upgrade-existing-pcm --migrate-legacy` with a fresh target backup and the exact same sample stream. The builder checks the backed-up sample bytes, retains target imports and logic, changes the resident number and applies the merged upload-start cancellation fix. Review the staged controller image, catalogue and trigger as one migration. Incompatible custom music code needs separate review. Without `--app-source`, the builder uses the generic repository app; do not use that default to replace a customized target blindly.
 
 ## Offline checks

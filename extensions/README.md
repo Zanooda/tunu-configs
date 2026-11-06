@@ -1,10 +1,38 @@
 # Warp-sound trigger prototype
 
-`warp-sound.toml` is deliberately disabled. It observes `engine-ecu.speed`; `warp-sound.py` requires a recent speed event whose `from` matches its own prior speed observation and whose prior observation is no more than one second old. It also checks the current speed and `vehicle.state`, drops concurrent work instead of queueing it, rearms at or below 45 km/h, and enforces a 45-second cooldown. Timestamps measure event-service observation emission age, not ECU acquisition age. The helper stores its baseline and latch under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
+`warp-sound.toml` is deliberately disabled. It observes `engine-ecu.speed`; the trigger requires a recent speed event whose `from` matches its own prior speed observation and whose prior observation is no more than one second old. It also checks the current speed and `vehicle.state`, drops concurrent work instead of queueing it, rearms at or below 45 km/h, and enforces a 45-second cooldown. Timestamps measure event-service observation emission age, not ECU acquisition age. The helper stores its baseline and latch under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
 
 The generic `app.lisp` keeps sample playback disabled and imports no private audio. Only the generated private app image injects the `foc-play-samples` player, sample imports and dispatch. New builds default to song 240; the staged trigger uses the same selected number. It sends no PCM over CAN. The waveform, generated app and staged bundle remain private and are not distributed here.
 
 The helper invalidates its baseline and arming after stale, out-of-order, mismatched or invalid observations, so a crossing needs a recent matching predecessor observed by this helper. This bounds the observation chain but cannot identify a reconnect that occurs within the one-second window. Keep the rule disabled until deployment review confirms event continuity and target runtime behavior.
+
+## Native handler for speed events
+
+Use `warp-trigger/` for enabled, high-frequency speed rules. It implements the
+same observation policy as the Python helper, without starting Python or
+`redis-cli` for each event. Each invocation uses one Redis connection with a
+200 ms connect timeout and a 400 ms total command deadline. It keeps the same
+state key, 50 km/h crossing, 45 km/h rearm and 45-second cooldown.
+
+```sh
+cd extensions/warp-trigger
+CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags '-s -w' -o tunu-warp-trigger .
+go test -race ./...
+go vet ./...
+```
+
+The private bundle builder stages this binary under `extensions/bin/` and an
+executable `extensions/warp-sound` wrapper with the selected resident number.
+Install both at the corresponding paths under `/data/extensions`; the supplied
+rule calls that wrapper. For an existing installation, back up the rule and
+update its command from the Python helper to the wrapper. Keep
+`concurrency = "drop"` and the existing timeout; restart only
+`librescoot-events` after changing its rule and verify it loads. The binary
+defaults to resident song 240; the wrapper passes the prepared number with
+`--song-number`. `--state-key` and `--music-channel`
+allow isolated diagnostics without modifying the real latch or sending music
+commands. The Python helper remains available as a policy reference and
+fallback; do not run both handlers for the same input.
 
 Offline tests:
 
